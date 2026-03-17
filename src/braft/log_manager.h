@@ -70,7 +70,7 @@ public:
         std::vector<LogEntry*> _entries;
     };
 
-    LogManager();
+    LogManager(std::string group_id);
     BRAFT_MOCK ~LogManager();
     int init(const LogManagerOptions& options);
 
@@ -226,6 +226,8 @@ friend class AppendBatcher;
     LogId _virtual_first_log_id;
 
     bthread::ExecutionQueueId<StableClosure*> _disk_queue;
+    
+    std::string _group_id;
 };
 
 }  //  namespace braft

@@ -44,7 +44,7 @@ DEFINE_bool(raft_step_down_when_vote_timedout, true,
             "candidate steps down when reaching timeout");
 BRPC_VALIDATE_GFLAG(raft_step_down_when_vote_timedout, brpc::PassValidate);
 
-DEFINE_bool(raft_enable_append_entries_cache, false,
+ DEFINE_bool(raft_enable_append_entries_cache, false,
             "enable cache for out-of-order append entries requests, should used when "
             "pipeline replication is enabled (raft_max_parallel_append_entries_rpc_num > 1).");
 BRPC_VALIDATE_GFLAG(raft_enable_append_entries_cache, ::brpc::PassValidate);
@@ -271,23 +271,34 @@ int NodeImpl::init_snapshot_storage() {
 }
 
 int NodeImpl::init_log_storage() {
-    CHECK(_fsm_caller);
-    if (_options.log_storage) {
-        _log_storage = _options.log_storage;
-    } else {
-        _log_storage = LogStorage::create(_options.log_uri);
-    }
-    if (!_log_storage) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " find log storage failed, uri " << _options.log_uri;
-        return -1;
-    }
-    _log_manager = new LogManager();
-    LogManagerOptions log_manager_options;
-    log_manager_options.log_storage = _log_storage;
-    log_manager_options.configuration_manager = _config_manager;
-    log_manager_options.fsm_caller = _fsm_caller;
-    return _log_manager->init(log_manager_options);
+  int64_t start_time = butil::monotonic_time_ms();
+  CHECK(_fsm_caller);
+  if (_options.log_storage) {
+    _log_storage = _options.log_storage;
+  } else {
+    _log_storage = LogStorage::create(_options.log_uri);
+  }
+  if (!_log_storage) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " find log storage failed, uri " << _options.log_uri;
+    return -1;
+  }
+  _log_manager = new LogManager(_group_id);
+  LogManagerOptions log_manager_options;
+  log_manager_options.log_storage = _log_storage;
+  log_manager_options.configuration_manager = _config_manager;
+  log_manager_options.fsm_caller = _fsm_caller;
+   int64_t log_manager_init_time = butil::monotonic_time_ms();
+  int ret =  _log_manager->init(log_manager_options);  
+ 
+  int64_t end_time = butil::monotonic_time_ms();
+  
+  LOG_IF(INFO, end_time - start_time > 1000)
+      << "NodeImpl::init_log_storage takes too much time, total_time="
+      << (end_time - start_time) << "ms"
+      << " before_log_manager_init_time=" << (log_manager_init_time - start_time) << "ms"
+      << " log_manager_init_time=" << (end_time - log_manager_init_time) << "ms";
+  return ret;
 }
 
 int NodeImpl::init_meta_storage() {
@@ -489,177 +500,207 @@ int NodeImpl::bootstrap(const BootstrapOptions& options) {
     return 0;
 }
 
-int NodeImpl::init(const NodeOptions& options) {
-    _options = options;
+int NodeImpl::init(const NodeOptions &options) {
+  int64_t start_time = butil::monotonic_time_ms();
+  _options = options;
 
-    // check _server_id
-    if (butil::IP_ANY == _server_id.addr.ip) {
-        LOG(ERROR) << "Group " << _group_id 
-                   << " Node can't started from IP_ANY";
-        return -1;
+  // check _server_id
+  if (butil::IP_ANY == _server_id.addr.ip) {
+    LOG(ERROR) << "Group " << _group_id << " Node can't started from IP_ANY";
+    return -1;
+  }
+
+  if (!global_node_manager->server_exists(_server_id.addr)) {
+    LOG(ERROR) << "Group " << _group_id << " No RPC Server attached to "
+               << _server_id.addr
+               << ", did you forget to call braft::add_service()?";
+    return -1;
+  }
+
+  if (options.witness) {
+    // When this node is a witness, set the election_timeout to be twice
+    // of the normal replica to ensure that the normal replica has a higher
+    // priority and is selected as the master
+    if (FLAGS_raft_enable_witness_to_leader) {
+      CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms * 2));
+      CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms * 2 +
+                                             options.max_clock_drift_ms));
     }
+  } else {
+    CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
+    CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms +
+                                           options.max_clock_drift_ms));
+  }
+  CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
+  CHECK_EQ(0, _snapshot_timer.init(this, options.snapshot_interval_s * 1000));
 
-    if (!global_node_manager->server_exists(_server_id.addr)) {
-        LOG(ERROR) << "Group " << _group_id
-                   << " No RPC Server attached to " << _server_id.addr
-                   << ", did you forget to call braft::add_service()?";
-        return -1;
-    }
-    if (options.witness) {
-        // When this node is a witness, set the election_timeout to be twice 
-        // of the normal replica to ensure that the normal replica has a higher
-        // priority and is selected as the master
-        if (FLAGS_raft_enable_witness_to_leader) {
-            CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms * 2));
-            CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms * 2 + options.max_clock_drift_ms));
-        }
-    } else {
-        CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
-        CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms + options.max_clock_drift_ms));
-    }
-    CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
-    CHECK_EQ(0, _snapshot_timer.init(this, options.snapshot_interval_s * 1000));
+  _config_manager = new ConfigurationManager();
 
-    _config_manager = new ConfigurationManager();
+  if (bthread::execution_queue_start(&_apply_queue_id, NULL,
+                                     execute_applying_tasks, this) != 0) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " fail to start execution_queue";
+    return -1;
+  }
 
-    if (bthread::execution_queue_start(&_apply_queue_id, NULL,
-                                       execute_applying_tasks, this) != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id 
-                   << " fail to start execution_queue";
-        return -1;
-    }
+  _apply_queue = execution_queue_address(_apply_queue_id);
+  if (!_apply_queue) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " fail to address execution_queue";
+    return -1;
+  }
 
-    _apply_queue = execution_queue_address(_apply_queue_id);
-    if (!_apply_queue) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " fail to address execution_queue";
-        return -1;
-    }
+  // Create _fsm_caller first as log_manager needs it to report error
+  _fsm_caller = new FSMCaller();
 
-    // Create _fsm_caller first as log_manager needs it to report error
-    _fsm_caller = new FSMCaller();
+  _leader_lease.init(options.election_timeout_ms);
+  if (options.witness) {
+    _follower_lease.init(options.election_timeout_ms * 2,
+                         options.max_clock_drift_ms);
+  } else {
+    _follower_lease.init(options.election_timeout_ms,
+                         options.max_clock_drift_ms);
+  }
 
-    _leader_lease.init(options.election_timeout_ms);
-    if (options.witness) {
-        _follower_lease.init(options.election_timeout_ms * 2, options.max_clock_drift_ms);
-    } else {
-        _follower_lease.init(options.election_timeout_ms, options.max_clock_drift_ms);
-    }
+  int64_t before_init_log_storage_time = butil::monotonic_time_ms();
 
-    // log storage and log manager init
-    if (init_log_storage() != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " init_log_storage failed";
-        return -1;
-    }
+  // log storage and log manager init
+  if (init_log_storage() != 0) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " init_log_storage failed";
+    return -1;
+  }
 
-    if (init_fsm_caller(LogId(0, 0)) != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " init_fsm_caller failed";
-        return -1;
-    }
+  int64_t after_init_log_storage_time = butil::monotonic_time_ms();
 
-    // commitment manager init
-    _ballot_box = new BallotBox();
-    BallotBoxOptions ballot_box_options;
-    ballot_box_options.waiter = _fsm_caller;
-    ballot_box_options.closure_queue = _closure_queue;
-    if (_ballot_box->init(ballot_box_options) != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " init _ballot_box failed";
-        return -1;
-    }
+  if (init_fsm_caller(LogId(0, 0)) != 0) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " init_fsm_caller failed";
+    return -1;
+  }
 
-    // snapshot storage init and load
-    // NOTE: snapshot maybe discard entries when snapshot saved but not discard entries.
-    //      init log storage before snapshot storage, snapshot storage will update configration
-    if (init_snapshot_storage() != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " init_snapshot_storage failed";
-        return -1;
-    }
+  // commitment manager init
+  _ballot_box = new BallotBox();
+  BallotBoxOptions ballot_box_options;
+  ballot_box_options.waiter = _fsm_caller;
+  ballot_box_options.closure_queue = _closure_queue;
+  if (_ballot_box->init(ballot_box_options) != 0) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " init _ballot_box failed";
+    return -1;
+  }
 
-    butil::Status st = _log_manager->check_consistency();
-    if (!st.ok()) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " is initialized with inconsitency log: "
-                   << st;
-        return -1;
-    }
+  int64_t before_init_snapshot_storage_time = butil::monotonic_time_ms();
+  // snapshot storage init and load
+  // NOTE: snapshot maybe discard entries when snapshot saved but not discard
+  // entries.
+  //      init log storage before snapshot storage, snapshot storage will update
+  //      configration
+  if (init_snapshot_storage() != 0) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " init_snapshot_storage failed";
+    return -1;
+  }
 
-    _conf.id = LogId();
-    // if have log using conf in log, else using conf in options
-    if (_log_manager->last_log_index() > 0) {
-        _log_manager->check_and_set_configuration(&_conf);
-    } else {
-        _conf.conf = _options.initial_conf;
-    }
-    
-    // init meta and check term
-    if (init_meta_storage() != 0) {
-        LOG(ERROR) << "node " << _group_id << ":" << _server_id
-                   << " init_meta_storage failed";
-        return -1;
-    }
+  int64_t after_init_snapshot_storage_time = butil::monotonic_time_ms();
 
-    // first start, we can vote directly
-    if (_current_term == 1 && _voted_id.is_empty()) {
-        _follower_lease.reset();
-    }
+  butil::Status st = _log_manager->check_consistency();
+  if (!st.ok()) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " is initialized with inconsitency log: " << st;
+    return -1;
+  }
 
-    // init replicator
-    ReplicatorGroupOptions rg_options;
-    rg_options.heartbeat_timeout_ms = heartbeat_timeout(_options.election_timeout_ms);
-    rg_options.election_timeout_ms = _options.election_timeout_ms;
-    rg_options.log_manager = _log_manager;
-    rg_options.ballot_box = _ballot_box;
-    rg_options.node = this;
-    rg_options.snapshot_throttle = _options.snapshot_throttle
-        ? _options.snapshot_throttle->get()
-        : NULL;
-    rg_options.snapshot_storage = _snapshot_executor
-        ? _snapshot_executor->snapshot_storage()
-        : NULL;
-    _replicator_group.init(NodeId(_group_id, _server_id), rg_options);
+  _conf.id = LogId();
+  // if have log using conf in log, else using conf in options
+  if (_log_manager->last_log_index() > 0) {
+    _log_manager->check_and_set_configuration(&_conf);
+  } else {
+    _conf.conf = _options.initial_conf;
+  }
 
-    // set state to follower
-    _state = STATE_FOLLOWER;
+  int64_t before_init_meta_storage_time = butil::monotonic_time_ms();
 
-    LOG(INFO) << "node " << _group_id << ":" << _server_id << " init,"
-              << " term: " << _current_term
-              << " last_log_id: " << _log_manager->last_log_id()
-              << " conf: " << _conf.conf
-              << " old_conf: " << _conf.old_conf;
+  // init meta and check term
+  if (init_meta_storage() != 0) {
+    LOG(ERROR) << "node " << _group_id << ":" << _server_id
+               << " init_meta_storage failed";
+    return -1;
+  }
 
-    // start snapshot timer
-    if (_snapshot_executor && _options.snapshot_interval_s > 0) {
-        BRAFT_VLOG << "node " << _group_id << ":" << _server_id
-                   << " term " << _current_term << " start snapshot_timer";
-        _snapshot_timer.start();
-    }
+  int64_t after_init_meta_storage_time = butil::monotonic_time_ms();
 
-    if (!_conf.empty()) {
-        step_down(_current_term, false, butil::Status::OK());
-    }
+  // first start, we can vote directly
+  if (_current_term == 1 && _voted_id.is_empty()) {
+    _follower_lease.reset();
+  }
 
-    // add node to NodeManager
-    if (!global_node_manager->add(this)) {
-        LOG(ERROR) << "NodeManager add " << _group_id 
-                   << ":" << _server_id << " failed";
-        return -1;
-    }
+  // init replicator
+  ReplicatorGroupOptions rg_options;
+  rg_options.heartbeat_timeout_ms =
+      heartbeat_timeout(_options.election_timeout_ms);
+  rg_options.election_timeout_ms = _options.election_timeout_ms;
+  rg_options.log_manager = _log_manager;
+  rg_options.ballot_box = _ballot_box;
+  rg_options.node = this;
+  rg_options.snapshot_throttle =
+      _options.snapshot_throttle ? _options.snapshot_throttle->get() : NULL;
+  rg_options.snapshot_storage =
+      _snapshot_executor ? _snapshot_executor->snapshot_storage() : NULL;
+  _replicator_group.init(NodeId(_group_id, _server_id), rg_options);
 
-    // Now the raft node is started , have to acquire the lock to avoid race
-    // conditions
-    std::unique_lock<raft_mutex_t> lck(_mutex);
-    if (_conf.stable() && _conf.conf.size() == 1u
-            && _conf.conf.contains(_server_id)) {
-        // The group contains only this server which must be the LEADER, trigger
-        // the timer immediately.
-        elect_self(&lck);
-    }
+  // set state to follower
+  _state = STATE_FOLLOWER;
 
-    return 0;
+  LOG(INFO) << "node " << _group_id << ":" << _server_id << " init,"
+            << " term: " << _current_term
+            << " last_log_id: " << _log_manager->last_log_id()
+            << " conf: " << _conf.conf << " old_conf: " << _conf.old_conf;
+
+  // start snapshot timer
+  if (_snapshot_executor && _options.snapshot_interval_s > 0) {
+    BRAFT_VLOG << "node " << _group_id << ":" << _server_id << " term "
+               << _current_term << " start snapshot_timer";
+    _snapshot_timer.start();
+  }
+
+  if (!_conf.empty()) {
+    step_down(_current_term, false, butil::Status::OK());
+  }
+
+  // add node to NodeManager
+  if (!global_node_manager->add(this)) {
+    LOG(ERROR) << "NodeManager add " << _group_id << ":" << _server_id
+               << " failed";
+    return -1;
+  }
+
+  // Now the raft node is started , have to acquire the lock to avoid race
+  // conditions
+  std::unique_lock<raft_mutex_t> lck(_mutex);
+  if (_conf.stable() && _conf.conf.size() == 1u &&
+      _conf.conf.contains(_server_id)) {
+    // The group contains only this server which must be the LEADER, trigger
+    // the timer immediately.
+    elect_self(&lck);
+  }
+
+  int64_t end_time = butil::monotonic_time_ms();
+
+  int64_t elapsed_time = end_time - start_time;
+
+  LOG_IF(INFO, elapsed_time > 1000)
+      << "NodeImpl init Node " << _group_id << ":" << _server_id
+      << " total=" << elapsed_time << " ms" 
+      << " before_init_log_storage:" << (before_init_log_storage_time - start_time)  << " ms"       
+      << " init_log_storage: " << (after_init_log_storage_time - before_init_log_storage_time)  << " ms" 
+      << " before_init_snapshot_storage: " << (before_init_snapshot_storage_time - after_init_log_storage_time)  << " ms" 
+      << " init_snapshot_storage: " << (after_init_snapshot_storage_time - before_init_snapshot_storage_time)  << " ms" 
+      << " before_init_meta_storage: " << (before_init_meta_storage_time - after_init_snapshot_storage_time)  << " ms"
+      << " init_meta_storage: "  << (after_init_meta_storage_time - before_init_meta_storage_time)  << " ms"
+      << " after_init_meta_storage: " << (end_time - after_init_meta_storage_time)  << " ms"; 
+
+  return 0;
 }
 
 DEFINE_int32(raft_apply_batch, 32, "Max number of tasks that can be applied "
@@ -2388,192 +2429,228 @@ private:
     int64_t _term;
 };
 
-void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
-                                             const AppendEntriesRequest* request,
-                                             AppendEntriesResponse* response,
-                                             google::protobuf::Closure* done,
-                                             bool from_append_entries_cache) {
-    std::vector<LogEntry*> entries;
-    entries.reserve(request->entries_size());
-    brpc::ClosureGuard done_guard(done);
-    std::unique_lock<raft_mutex_t> lck(_mutex);
+void NodeImpl::handle_append_entries_request(
+    brpc::Controller *cntl, const AppendEntriesRequest *request,
+    AppendEntriesResponse *response, google::protobuf::Closure *done,
+    bool from_append_entries_cache) {
+  std::vector<LogEntry *> entries;
+  entries.reserve(request->entries_size());
+  brpc::ClosureGuard done_guard(done);
+  int64_t start_time = butil::monotonic_time_ms();
+  std::unique_lock<raft_mutex_t> lck(_mutex);
+  int64_t elapsed_time_mutex = butil::monotonic_time_ms();
 
-    // pre set term, to avoid get term in lock
+  // pre set term, to avoid get term in lock
+  response->set_term(_current_term);
+
+  if (!is_active_state(_state)) {
+    const int64_t saved_current_term = _current_term;
+    const State saved_state = _state;
+    lck.unlock();
+    LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                 << " is not in active state " << "current_term "
+                 << saved_current_term << " state " << state2str(saved_state);
+    cntl->SetFailed(EINVAL, "node %s:%s is not in active state, state %s",
+                    _group_id.c_str(), _server_id.to_string().c_str(),
+                    state2str(saved_state));
+    return;
+  }
+  int64_t elapsed_time_active = butil::monotonic_time_ms();
+  PeerId server_id;
+  if (0 != server_id.parse(request->server_id())) {
+    lck.unlock();
+    LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                 << " received AppendEntries from " << request->server_id()
+                 << " server_id bad format";
+    cntl->SetFailed(brpc::EREQUEST, "Fail to parse server_id `%s'",
+                    request->server_id().c_str());
+    return;
+  }
+  int64_t elapsed_time_parse = butil::monotonic_time_ms();
+  // check stale term
+  if (request->term() < _current_term) {
+    const int64_t saved_current_term = _current_term;
+    lck.unlock();
+    LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                 << " ignore stale AppendEntries from " << request->server_id()
+                 << " in term " << request->term() << " current_term "
+                 << saved_current_term;
+    response->set_success(false);
+    response->set_term(saved_current_term);
+    return;
+  }
+
+  // check term and state to step down
+  check_step_down(request->term(), server_id);
+  int64_t elapsed_time_step_down = butil::monotonic_time_ms();
+  if (server_id != _leader_id) {
+    LOG(ERROR) << "Another peer " << _group_id << ":" << server_id
+               << " declares that it is the leader at term=" << _current_term
+               << " which was occupied by leader=" << _leader_id;
+    // Increase the term by 1 and make both leaders step down to minimize the
+    // loss of split brain
+    butil::Status status;
+    status.set_error(ELEADERCONFLICT, "More than one leader in the same term.");
+    step_down(request->term() + 1, false, status);
+    response->set_success(false);
+    response->set_term(request->term() + 1);
+    return;
+  }
+
+  if (!from_append_entries_cache) {
+    // Requests from cache already updated timestamp
+    _follower_lease.renew(_leader_id);
+  }
+  int64_t elapsed_time_renew = butil::monotonic_time_ms();
+  if (request->entries_size() > 0 &&
+      (_snapshot_executor && _snapshot_executor->is_installing_snapshot())) {
+    LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                 << " received append entries while installing snapshot";
+    cntl->SetFailed(EBUSY, "Is installing snapshot");
+    return;
+  }
+  int64_t elapsed_time_snapshot = butil::monotonic_time_ms();
+
+  const int64_t prev_log_index = request->prev_log_index();
+  const int64_t prev_log_term = request->prev_log_term();
+  int64_t elapsed_time_check = butil::monotonic_time_ms();
+  const int64_t local_prev_log_term = _log_manager->get_term(prev_log_index);
+  int64_t elapsed_time_term_after = butil::monotonic_time_ms();
+  if (local_prev_log_term != prev_log_term) {
+    int64_t last_index = _log_manager->last_log_index();
+    int64_t saved_term = request->term();
+    int saved_entries_size = request->entries_size();
+    std::string rpc_server_id = request->server_id();
+    if (!from_append_entries_cache &&
+        handle_out_of_order_append_entries(cntl, request, response, done,
+                                           last_index)) {
+      // It's not safe to touch cntl/request/response/done after this point,
+      // since the ownership is tranfered to the cache.
+      lck.unlock();
+      done_guard.release();
+      LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                   << " cache out-of-order AppendEntries from " << rpc_server_id
+                   << " in term " << saved_term << " prev_log_index "
+                   << prev_log_index << " prev_log_term " << prev_log_term
+                   << " local_prev_log_term " << local_prev_log_term
+                   << " last_log_index " << last_index << " entries_size "
+                   << saved_entries_size;
+      return;
+    }
+
+    response->set_success(false);
     response->set_term(_current_term);
-
-    if (!is_active_state(_state)) {
-        const int64_t saved_current_term = _current_term;
-        const State saved_state = _state;
-        lck.unlock();
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id 
-                     << " is not in active state " << "current_term " << saved_current_term 
-                     << " state " << state2str(saved_state);
-        cntl->SetFailed(EINVAL, "node %s:%s is not in active state, state %s", 
-                _group_id.c_str(), _server_id.to_string().c_str(), state2str(saved_state));
-        return;
+    response->set_last_log_index(last_index);
+    lck.unlock();
+    if (local_prev_log_term != 0) {
+      LOG(WARNING) << "node " << _group_id << ":" << _server_id
+                   << " reject term_unmatched AppendEntries from "
+                   << request->server_id() << " in term " << request->term()
+                   << " prev_log_index " << request->prev_log_index()
+                   << " prev_log_term " << request->prev_log_term()
+                   << " local_prev_log_term " << local_prev_log_term
+                   << " last_log_index " << last_index << " entries_size "
+                   << request->entries_size() << " from_append_entries_cache: "
+                   << from_append_entries_cache;
     }
+    return;
+  }
+  int64_t elapsed_time_heart_before = butil::monotonic_time_ms();
+  int64_t elapsed_time_heart_end =0;
+  int64_t elapsed_time = 0;
+  
+  if (request->entries_size() == 0) {
+    response->set_success(true);
+    response->set_term(_current_term);
+    response->set_last_log_index(_log_manager->last_log_index());
+    response->set_readonly(_node_readonly);
+    lck.unlock();
+    // see the comments at FollowerStableClosure::run()
+    _ballot_box->set_last_committed_index(
+        std::min(request->committed_index(), prev_log_index));
+    elapsed_time_heart_end = butil::monotonic_time_ms();
 
-    PeerId server_id;
-    if (0 != server_id.parse(request->server_id())) {
-        lck.unlock();
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " received AppendEntries from " << request->server_id()
-                     << " server_id bad format";
-        cntl->SetFailed(brpc::EREQUEST,
-                        "Fail to parse server_id `%s'",
-                        request->server_id().c_str());
-        return;
-    }
+    elapsed_time = elapsed_time_heart_end - start_time;
 
-    // check stale term
-    if (request->term() < _current_term) {
-        const int64_t saved_current_term = _current_term;
-        lck.unlock();
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " ignore stale AppendEntries from " << request->server_id()
-                     << " in term " << request->term()
-                     << " current_term " << saved_current_term;
-        response->set_success(false);
-        response->set_term(saved_current_term);
-        return;
-    }
+    LOG_IF(INFO, elapsed_time > 1000)
+        << "handle_append_entries_request size: " << request->entries().size()
+        << " elapsed: " << elapsed_time
+        << " mutex: " << (elapsed_time_mutex - start_time)
+        << " active: " << (elapsed_time_active - elapsed_time_mutex)
+        << " parse: " << (elapsed_time_parse - elapsed_time_active)
+        << " step_down: " << (elapsed_time_step_down - elapsed_time_parse)
+        << " renew: " << (elapsed_time_renew - elapsed_time_step_down)
+        << " snapshot: " << (elapsed_time_snapshot - elapsed_time_renew)
+        << " check1: " << (elapsed_time_check - elapsed_time_snapshot)
+        << " get_term: " << (elapsed_time_term_after - elapsed_time_check)
+        << " check2: " << (elapsed_time_heart_before - elapsed_time_term_after)
+        << " id: " << this->node_id().to_string();
+    return;
+  }
 
-    // check term and state to step down
-    check_step_down(request->term(), server_id);   
-     
-    if (server_id != _leader_id) {
-        LOG(ERROR) << "Another peer " << _group_id << ":" << server_id
-                   << " declares that it is the leader at term=" << _current_term 
-                   << " which was occupied by leader=" << _leader_id;
-        // Increase the term by 1 and make both leaders step down to minimize the
-        // loss of split brain
-        butil::Status status;
-        status.set_error(ELEADERCONFLICT, "More than one leader in the same term."); 
-        step_down(request->term() + 1, false, status);
-        response->set_success(false);
-        response->set_term(request->term() + 1);
-        return;
-    }
-
-    if (!from_append_entries_cache) {
-        // Requests from cache already updated timestamp
-        _follower_lease.renew(_leader_id);
-    }
-
-    if (request->entries_size() > 0 &&
-            (_snapshot_executor
-                && _snapshot_executor->is_installing_snapshot())) {
-        LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                     << " received append entries while installing snapshot";
-        cntl->SetFailed(EBUSY, "Is installing snapshot");
-        return;
-    }
-
-    const int64_t prev_log_index = request->prev_log_index();
-    const int64_t prev_log_term = request->prev_log_term();
-    const int64_t local_prev_log_term = _log_manager->get_term(prev_log_index);
-    if (local_prev_log_term != prev_log_term) {
-        int64_t last_index = _log_manager->last_log_index();
-        int64_t saved_term = request->term();
-        int     saved_entries_size = request->entries_size();
-        std::string rpc_server_id = request->server_id();
-        if (!from_append_entries_cache &&
-            handle_out_of_order_append_entries(
-                    cntl, request, response, done, last_index)) {
-            // It's not safe to touch cntl/request/response/done after this point,
-            // since the ownership is tranfered to the cache.
-            lck.unlock();
-            done_guard.release();
-            LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                         << " cache out-of-order AppendEntries from " 
-                         << rpc_server_id
-                         << " in term " << saved_term
-                         << " prev_log_index " << prev_log_index
-                         << " prev_log_term " << prev_log_term
-                         << " local_prev_log_term " << local_prev_log_term
-                         << " last_log_index " << last_index
-                         << " entries_size " << saved_entries_size;
-            return;
+  // Parse request
+  butil::IOBuf data_buf;
+  data_buf.swap(cntl->request_attachment());
+  int64_t index = prev_log_index;
+  for (int i = 0; i < request->entries_size(); i++) {
+    index++;
+    const EntryMeta &entry = request->entries(i);
+    if (entry.type() != ENTRY_TYPE_UNKNOWN) {
+      LogEntry *log_entry = new LogEntry();
+      log_entry->AddRef();
+      log_entry->id.term = entry.term();
+      log_entry->id.index = index;
+      log_entry->type = (EntryType)entry.type();
+      if (entry.peers_size() > 0) {
+        log_entry->peers = new std::vector<PeerId>;
+        for (int i = 0; i < entry.peers_size(); i++) {
+          log_entry->peers->push_back(entry.peers(i));
         }
-
-        response->set_success(false);
-        response->set_term(_current_term);
-        response->set_last_log_index(last_index);
-        lck.unlock();
-        if (local_prev_log_term != 0) {
-            LOG(WARNING) << "node " << _group_id << ":" << _server_id
-                         << " reject term_unmatched AppendEntries from " 
-                         << request->server_id()
-                         << " in term " << request->term()
-                         << " prev_log_index " << request->prev_log_index()
-                         << " prev_log_term " << request->prev_log_term()
-                         << " local_prev_log_term " << local_prev_log_term
-                         << " last_log_index " << last_index
-                         << " entries_size " << request->entries_size()
-                         << " from_append_entries_cache: " << from_append_entries_cache;
+        CHECK_EQ(log_entry->type, ENTRY_TYPE_CONFIGURATION);
+        if (entry.old_peers_size() > 0) {
+          log_entry->old_peers = new std::vector<PeerId>;
+          for (int i = 0; i < entry.old_peers_size(); i++) {
+            log_entry->old_peers->push_back(entry.old_peers(i));
+          }
         }
-        return;
+      } else {
+        CHECK_NE(entry.type(), ENTRY_TYPE_CONFIGURATION);
+      }
+      if (entry.has_data_len()) {
+        int len = entry.data_len();
+        data_buf.cutn(&log_entry->data, len);
+      }
+      entries.push_back(log_entry);
     }
+  }
 
-    if (request->entries_size() == 0) {
-        response->set_success(true);
-        response->set_term(_current_term);
-        response->set_last_log_index(_log_manager->last_log_index());
-        response->set_readonly(_node_readonly);
-        lck.unlock();
-        // see the comments at FollowerStableClosure::run()
-        _ballot_box->set_last_committed_index(
-                std::min(request->committed_index(),
-                         prev_log_index));
-        return;
-    }
+  // check out-of-order cache
+  check_append_entries_cache(index);
 
-    // Parse request
-    butil::IOBuf data_buf;
-    data_buf.swap(cntl->request_attachment());
-    int64_t index = prev_log_index;
-    for (int i = 0; i < request->entries_size(); i++) {
-        index++;
-        const EntryMeta& entry = request->entries(i);
-        if (entry.type() != ENTRY_TYPE_UNKNOWN) {
-            LogEntry* log_entry = new LogEntry();
-            log_entry->AddRef();
-            log_entry->id.term = entry.term();
-            log_entry->id.index = index;
-            log_entry->type = (EntryType)entry.type();
-            if (entry.peers_size() > 0) {
-                log_entry->peers = new std::vector<PeerId>;
-                for (int i = 0; i < entry.peers_size(); i++) {
-                    log_entry->peers->push_back(entry.peers(i));
-                }
-                CHECK_EQ(log_entry->type, ENTRY_TYPE_CONFIGURATION);
-                if (entry.old_peers_size() > 0) {
-                    log_entry->old_peers = new std::vector<PeerId>;
-                    for (int i = 0; i < entry.old_peers_size(); i++) {
-                        log_entry->old_peers->push_back(entry.old_peers(i));
-                    }
-                }
-            } else {
-                CHECK_NE(entry.type(), ENTRY_TYPE_CONFIGURATION);
-            }
-            if (entry.has_data_len()) {
-                int len = entry.data_len();
-                data_buf.cutn(&log_entry->data, len);
-            }
-            entries.push_back(log_entry);
-        }
-    }
+  FollowerStableClosure *c = new FollowerStableClosure(
+      cntl, request, response, done_guard.release(), this, _current_term);
+  _log_manager->append_entries(&entries, c);
 
-    // check out-of-order cache
-    check_append_entries_cache(index);
+  // update configuration after _log_manager updated its memory status
+  _log_manager->check_and_set_configuration(&_conf);
+  
+  elapsed_time_heart_end = butil::monotonic_time_ms();
 
-    FollowerStableClosure* c = new FollowerStableClosure(
-            cntl, request, response, done_guard.release(),
-            this, _current_term);
-    _log_manager->append_entries(&entries, c);
+  elapsed_time = elapsed_time_heart_end - start_time;
 
-    // update configuration after _log_manager updated its memory status
-    _log_manager->check_and_set_configuration(&_conf);
+ LOG_IF(INFO, elapsed_time > 1000)
+        << "handle_append_entries_request size: " << request->entries().size()
+        << " elapsed: " << elapsed_time
+        << " mutex: " << (elapsed_time_mutex - start_time)
+        << " active: " << (elapsed_time_active - elapsed_time_mutex)
+        << " parse: " << (elapsed_time_parse - elapsed_time_active)
+        << " step_down: " << (elapsed_time_step_down - elapsed_time_parse)
+        << " renew: " << (elapsed_time_renew - elapsed_time_step_down)
+        << " snapshot: " << (elapsed_time_snapshot - elapsed_time_renew)
+        << " check1: " << (elapsed_time_check - elapsed_time_snapshot)
+        << " get_term: " << (elapsed_time_term_after - elapsed_time_check)
+        << " check2: " << (elapsed_time_heart_before - elapsed_time_term_after)
+        << " id: " << this->node_id().to_string();
 }
 
 int NodeImpl::increase_term_to(int64_t new_term, const butil::Status& status) {

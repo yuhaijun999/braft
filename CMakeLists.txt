@@ -85,7 +85,7 @@ endif()
 
 include(FindOpenSSL)
 
-include_directories(
+include_directories(BEFORE
         ${GFLAGS_INCLUDE_PATH}
         ${PROTOBUF_INCLUDE_DIRS}
         ${LEVELDB_INCLUDE_PATH}
@@ -176,7 +176,7 @@ set(SOURCES
     ${PROTO_SRCS}
     )
 
-include_directories(
+include_directories(BEFORE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_BINARY_DIR}
 )

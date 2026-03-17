@@ -63,7 +63,7 @@ LogManagerOptions::LogManagerOptions()
     , fsm_caller(NULL)
 {}
 
-LogManager::LogManager()
+LogManager::LogManager(std::string group_id)
     : _log_storage(NULL)
     , _config_manager(NULL)
     , _stopped(false)
@@ -72,10 +72,12 @@ LogManager::LogManager()
     , _first_log_index(0)
     , _last_log_index(0)
 {
+    _group_id = group_id;
     CHECK_EQ(0, start_disk_thread());
 }
 
 int LogManager::init(const LogManagerOptions &options) {
+    int64_t start_time = butil::monotonic_time_ms();
     BAIDU_SCOPED_LOCK(_mutex);
     if (options.log_storage == NULL) {
         return EINVAL;
@@ -86,7 +88,9 @@ int LogManager::init(const LogManagerOptions &options) {
     }
     _log_storage = options.log_storage;
     _config_manager = options.configuration_manager;
+    int64_t before_log_storage_init_time = butil::monotonic_time_ms();
     int ret = _log_storage->init(_config_manager);
+    int64_t after_log_storage_init_time = butil::monotonic_time_ms();
     if (ret != 0) {
         return ret;
     }
@@ -97,6 +101,15 @@ int LogManager::init(const LogManagerOptions &options) {
     // after snapshot load finish.
     _disk_id.term = _log_storage->get_term(_last_log_index);
     _fsm_caller = options.fsm_caller;
+    int64_t end_time = butil::monotonic_time_ms();
+    
+    LOG_IF(INFO, end_time - start_time > 1000)
+        << "LogManager::init takes too much time"
+        << " group_id=" << _group_id
+        << " total_time=" << (end_time - start_time) << "ms"
+        << " before_log_storage_init_time=" << (before_log_storage_init_time - start_time) << "ms"
+        << " log_storage_init_time=" << (after_log_storage_init_time - before_log_storage_init_time) << "ms"
+        << " after_log_storage_init_time=" << (end_time - after_log_storage_init_time) << "ms";
     return 0;
 }
 
@@ -125,6 +138,8 @@ int LogManager::stop_disk_thread() {
 void LogManager::clear_memory_logs(const LogId& id) {
     LogEntry* entries_to_clear[256];
     size_t nentries = 0;
+    size_t total_cleared = 0;
+    int64_t clear_start_time = butil::monotonic_time_ms();
     do {
         nentries = 0;
         {
@@ -142,7 +157,14 @@ void LogManager::clear_memory_logs(const LogId& id) {
         for (size_t i = 0; i < nentries; ++i) {
             entries_to_clear[i]->Release();
         }
+        total_cleared += nentries;
     } while (nentries == ARRAY_SIZE(entries_to_clear));
+    int64_t clear_elapsed = butil::monotonic_time_ms() - clear_start_time;
+    LOG_IF(WARNING, clear_elapsed > 1000)
+        << "LogManager::clear_memory_logs slow"
+        << " group_id=" << _group_id
+        << " cleared=" << total_cleared
+        << " elapsed_ms=" << clear_elapsed;
 }
 
 int64_t LogManager::first_log_index() {
@@ -188,10 +210,22 @@ int64_t LogManager::last_log_index(bool is_flush) {
 }
 
 LogId LogManager::last_log_id(bool is_flush) {
+    int64_t last_log_id_start_time = butil::monotonic_time_ms();
     std::unique_lock<raft_mutex_t> lck(_mutex);
+    int64_t last_log_id_lock_time = butil::monotonic_time_ms();
     if (!is_flush) {
         if (_last_log_index >= _first_log_index) {
-            return LogId(_last_log_index, unsafe_get_term(_last_log_index));
+            int64_t before_get_term = butil::monotonic_time_ms();
+            int64_t term = unsafe_get_term(_last_log_index);
+            int64_t after_get_term = butil::monotonic_time_ms();
+            LOG_IF(WARNING, (after_get_term - last_log_id_start_time) > 1000)
+                << "LogManager::last_log_id slow"
+                << " group_id=" << _group_id
+                << " last_log_index=" << _last_log_index
+                << " lock_wait=" << (last_log_id_lock_time - last_log_id_start_time) << "ms"
+                << " unsafe_get_term=" << (after_get_term - before_get_term) << "ms"
+                << " total=" << (after_get_term - last_log_id_start_time) << "ms";
+            return LogId(_last_log_index, term);
         }
         return _last_snapshot_id;
     } else {
@@ -260,6 +294,8 @@ int LogManager::truncate_prefix(const int64_t first_index_kept,
     // container in O(1) time, one solution is a segmented double-linked list
     // along with a bounded queue as the indexer, of which the payoff is that
     // _logs_in_memory has to be bounded.
+    int64_t truncate_start_time = butil::monotonic_time_ms();
+    size_t logs_in_memory_size_before = _logs_in_memory.size();
     while (!_logs_in_memory.empty()) {
         LogEntry* entry = _logs_in_memory.front();
         if (entry->id.index < first_index_kept) {
@@ -269,19 +305,38 @@ int LogManager::truncate_prefix(const int64_t first_index_kept,
             break;
         }
     }
+    int64_t truncate_loop_time = butil::monotonic_time_ms();
     CHECK_GE(first_index_kept, _first_log_index);
     _first_log_index = first_index_kept;
     if (first_index_kept > _last_log_index) {
         // The entrie log is dropped
         _last_log_index = first_index_kept - 1;
     }
+    int64_t before_config_truncate_time = butil::monotonic_time_ms();
     _config_manager->truncate_prefix(first_index_kept);
+    int64_t after_config_truncate_time = butil::monotonic_time_ms();
     TruncatePrefixClosure* c = new TruncatePrefixClosure(first_index_kept);
     const int rc = bthread::execution_queue_execute(_disk_queue, c);
+    int64_t after_execq_time = butil::monotonic_time_ms();
     lck.unlock();
+    int64_t truncate_unlock_time = butil::monotonic_time_ms();
     for (size_t i = 0; i < saved_logs_in_memory.size(); ++i) {
         saved_logs_in_memory[i]->Release();
     }
+    int64_t truncate_release_time = butil::monotonic_time_ms();
+    int64_t total_elapsed = truncate_release_time - truncate_start_time;
+    LOG_IF(WARNING, total_elapsed > 1000)
+        << "LogManager::truncate_prefix slow"
+        << " group_id=" << _group_id
+        << " first_index_kept=" << first_index_kept
+        << " logs_in_memory_before=" << logs_in_memory_size_before
+        << " truncated=" << saved_logs_in_memory.size()
+        << " loop_ms=" << (truncate_loop_time - truncate_start_time)
+        << " config_truncate_ms=" << (after_config_truncate_time - before_config_truncate_time)
+        << " execq_ms=" << (after_execq_time - after_config_truncate_time)
+        << " unlock_ms=" << (truncate_unlock_time - after_execq_time)
+        << " release_ms=" << (truncate_release_time - truncate_unlock_time)
+        << " total_ms=" << total_elapsed;
     return rc;
 }
 
@@ -305,6 +360,7 @@ int LogManager::reset(const int64_t next_log_index,
 }
 
 void LogManager::unsafe_truncate_suffix(const int64_t last_index_kept) {
+    int64_t truncate_suffix_start_time = butil::monotonic_time_ms();
 
     if (last_index_kept < _applied_id.index) {
         LOG(FATAL) << "Can't truncate logs before _applied_id=" <<_applied_id.index
@@ -322,13 +378,23 @@ void LogManager::unsafe_truncate_suffix(const int64_t last_index_kept) {
         }
     }
     _last_log_index = last_index_kept;
+    int64_t before_get_term = butil::monotonic_time_ms();
     const int64_t last_term_kept = unsafe_get_term(last_index_kept);
+    int64_t after_get_term = butil::monotonic_time_ms();
     CHECK(last_index_kept == 0 || last_term_kept != 0)
         << "last_index_kept=" << last_index_kept;
     _config_manager->truncate_suffix(last_index_kept);
     TruncateSuffixClosure* tsc = new
             TruncateSuffixClosure(last_index_kept, last_term_kept);
     CHECK_EQ(0, bthread::execution_queue_execute(_disk_queue, tsc));
+    int64_t truncate_suffix_end_time = butil::monotonic_time_ms();
+    LOG_IF(WARNING, (truncate_suffix_end_time - truncate_suffix_start_time) > 1000)
+        << "LogManager::unsafe_truncate_suffix slow"
+        << " group_id=" << _group_id
+        << " last_index_kept=" << last_index_kept
+        << " memory_pop=" << (before_get_term - truncate_suffix_start_time) << "ms"
+        << " unsafe_get_term=" << (after_get_term - before_get_term) << "ms"
+        << " total=" << (truncate_suffix_end_time - truncate_suffix_start_time) << "ms";
 }
 
 int LogManager::check_and_resolve_conflict(
@@ -415,7 +481,9 @@ void LogManager::append_entries(
         done->status().set_error(EIO, "Corrupted LogStorage");
         return run_closure_in_bthread(done);
     }
+    int64_t append_start_time = butil::monotonic_time_ms();
     std::unique_lock<raft_mutex_t> lck(_mutex);
+    int64_t append_lock_time = butil::monotonic_time_ms();
     if (!entries->empty() && check_and_resolve_conflict(entries, done) != 0) {
         lck.unlock();
         // release entries
@@ -444,6 +512,14 @@ void LogManager::append_entries(
     int ret = bthread::execution_queue_execute(_disk_queue, done);
     CHECK_EQ(0, ret) << "execq execute failed, ret: " << ret << " err: " << berror();
     wakeup_all_waiter(lck);
+    int64_t append_end_time = butil::monotonic_time_ms();
+    int64_t append_total = append_end_time - append_start_time;
+    LOG_IF(WARNING, append_total > 1000)
+        << "LogManager::append_entries slow"
+        << " group_id=" << _group_id
+        << " entries_size=" << done->_entries.size()
+        << " lock_wait_ms=" << (append_lock_time - append_start_time)
+        << " total_ms=" << append_total;
 }
 
 void LogManager::append_to_storage(std::vector<LogEntry*>* to_append, 
@@ -623,7 +699,13 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
     BRAFT_VLOG << "Set snapshot last_included_index="
               << meta->last_included_index()
               << " last_included_term=" <<  meta->last_included_term();
+    int64_t set_snapshot_start_time = butil::monotonic_time_ms();
     std::unique_lock<raft_mutex_t> lck(_mutex);
+    int64_t set_snapshot_lock_time = butil::monotonic_time_ms();
+    // LOG(INFO) << "LogManager::set_snapshot logs_in_memory_size=" << _logs_in_memory.size()
+    //           << " last_included_index=" << meta->last_included_index()
+    //           << " current_last_snapshot_index=" << _last_snapshot_id.index;
+    int64_t after_log_time = butil::monotonic_time_ms();
     if (meta->last_included_index() <= _last_snapshot_id.index) {
         return;
     }
@@ -639,8 +721,21 @@ void LogManager::set_snapshot(const SnapshotMeta* meta) {
     entry.id = LogId(meta->last_included_index(), meta->last_included_term());
     entry.conf = conf;
     entry.old_conf = old_conf;
+    int64_t before_config_set_time = butil::monotonic_time_ms();
     _config_manager->set_snapshot(entry);
+    int64_t before_get_term_time = butil::monotonic_time_ms();
     int64_t term = unsafe_get_term(meta->last_included_index());
+    int64_t after_get_term_time = butil::monotonic_time_ms();
+    LOG_IF(WARNING, (after_get_term_time - set_snapshot_start_time) > 1000)
+        << "LogManager::set_snapshot slow before truncate"
+        << " group_id=" << _group_id
+        << " last_included_index=" << meta->last_included_index()
+        << " lock_wait=" << (set_snapshot_lock_time - set_snapshot_start_time) << "ms"
+        << " log_info=" << (after_log_time - set_snapshot_lock_time) << "ms"
+        << " build_conf=" << (before_config_set_time - after_log_time) << "ms"
+        << " config_set_snapshot=" << (before_get_term_time - before_config_set_time) << "ms"
+        << " unsafe_get_term=" << (after_get_term_time - before_get_term_time) << "ms"
+        << " total=" << (after_get_term_time - set_snapshot_start_time) << "ms";
 
     const LogId last_but_one_snapshot_id = _last_snapshot_id;
     _last_snapshot_id.index = meta->last_included_index();
@@ -728,32 +823,63 @@ int64_t LogManager::unsafe_get_term(const int64_t index) {
 }
 
 int64_t LogManager::get_term(const int64_t index) {
+    int64_t start_time = butil::monotonic_time_ms();
     if (index == 0) {
         return 0;
     }
     std::unique_lock<raft_mutex_t> lck(_mutex);
+    int64_t lock_time = butil::monotonic_time_ms();
+    int64_t lock_wait = lock_time - start_time;
     // check virtual first log
     if (index == _virtual_first_log_id.index) {
+        LOG_IF(WARNING, lock_wait > 1000) << "LogManager get_term slow(virtual_first_log_id)"
+               << " group_id=" << _group_id << " index=" << index
+               << " lock_wait=" << lock_wait << "ms";
         return _virtual_first_log_id.term;
     }
     // check last_snapshot_id
     if (index == _last_snapshot_id.index) {
+        LOG_IF(WARNING, lock_wait > 1000) << "LogManager get_term slow(last_snapshot_id)"
+               << " group_id=" << _group_id << " index=" << index
+               << " lock_wait=" << lock_wait << "ms";
         return _last_snapshot_id.term;
     }
     // out of range, direct return NULL
     // check this after check last_snapshot_id, because it is likely that
     // last_snapshot_id < first_log_index
     if (index > _last_log_index || index < _first_log_index) {
+        LOG_IF(WARNING, lock_wait > 1000) << "LogManager get_term slow(out_of_range)"
+               << " group_id=" << _group_id << " index=" << index
+               << " first_log_index=" << _first_log_index
+               << " last_log_index=" << _last_log_index
+               << " lock_wait=" << lock_wait << "ms";
         return 0;
     }
 
     LogEntry* entry = get_entry_from_memory(index);
     if (entry) {
+        LOG_IF(WARNING, lock_wait > 1000) << "LogManager get_term slow(memory_hit)"
+               << " group_id=" << _group_id << " index=" << index
+               << " lock_wait=" << lock_wait << "ms";
         return entry->id.term;
     }
     lck.unlock();
+    int64_t unlock_time = butil::monotonic_time_ms();
     g_read_term_from_storage << 1;
-    return _log_storage->get_term(index);
+    int64_t get_term_time = butil::monotonic_time_ms();
+    int64_t term = _log_storage->get_term(index);
+    int64_t end_time = butil::monotonic_time_ms();
+
+    int64_t elapsed_time = end_time - start_time;
+
+    LOG_IF(WARNING, elapsed_time > 1000) << "LogManager get_term slow(storage)"
+               << " group_id=" << _group_id << " index=" << index
+               << " total_time=" << elapsed_time << "ms"
+               << " lock_wait=" << lock_wait << "ms"
+               << " unlock=" << (unlock_time - lock_time) << "ms"
+               << " get_term=" << (end_time - get_term_time) << "ms";
+
+    return term;
 }
 
 LogEntry* LogManager::get_entry(const int64_t index) {
@@ -926,11 +1052,23 @@ void LogManager::get_status(LogManagerStatus* status) {
     if (!status) {
         return;
     }
+    int64_t get_status_start_time = butil::monotonic_time_ms();
     std::unique_lock<raft_mutex_t> lck(_mutex);
+    int64_t get_status_lock_time = butil::monotonic_time_ms();
     status->first_index = _log_storage->first_log_index();
+    int64_t first_index_time = butil::monotonic_time_ms();
     status->last_index = _log_storage->last_log_index();
+    int64_t last_index_time = butil::monotonic_time_ms();
     status->disk_index = _disk_id.index;
     status->known_applied_index = _applied_id.index;
+    int64_t get_status_total = last_index_time - get_status_start_time;
+    LOG_IF(WARNING, get_status_total > 1000)
+        << "LogManager::get_status slow"
+        << " group_id=" << _group_id
+        << " lock_wait=" << (get_status_lock_time - get_status_start_time) << "ms"
+        << " first_log_index=" << (first_index_time - get_status_lock_time) << "ms"
+        << " last_log_index=" << (last_index_time - first_index_time) << "ms"
+        << " total=" << get_status_total << "ms";
 }
 
 void LogManager::report_error(int error_code, const char* fmt, ...) {

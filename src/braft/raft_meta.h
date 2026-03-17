@@ -22,6 +22,7 @@
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 #include <bthread/execution_queue.h>
+#include <unordered_map>
 #include "braft/storage.h"
 
 namespace braft {
@@ -106,6 +107,11 @@ private:
 class KVBasedMergedMetaStorage : public RaftMetaStorage { 
 
 public:
+    struct term_peer_id_pair {
+        int64_t term;
+        PeerId peer_id;
+        
+    };
     explicit KVBasedMergedMetaStorage(const std::string& path);
     KVBasedMergedMetaStorage() {}
 
@@ -134,6 +140,12 @@ public:
 private:
 
     scoped_refptr<KVBasedMergedMetaStorageImpl> _merged_impl;
+    
+    raft_mutex_t _mutex;
+    std::unordered_map<VersionedGroupId, term_peer_id_pair>  _cache;
+    
+    
+    
 };
 
 // Inner class of KVBasedMergedMetaStorage
@@ -157,6 +169,7 @@ public:
         int64_t term;
         PeerId votedfor;
         VersionedGroupId vgid;
+        std::string serialized_value;  // pre-serialized protobuf
         Closure* done;
     };
 
@@ -186,6 +199,7 @@ private:
     void run_tasks(leveldb::WriteBatch& updates, Closure* dones[], size_t size);
 
     bthread::ExecutionQueueId<WriteTask> _queue_id;
+    leveldb::WriteOptions _write_options;  // cached, set once at init
 
     raft_mutex_t _mutex;
     bool _is_inited;

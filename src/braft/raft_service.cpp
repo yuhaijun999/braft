@@ -100,6 +100,8 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
     brpc::ClosureGuard done_guard(done);
     brpc::Controller* cntl =
         static_cast<brpc::Controller*>(cntl_base);
+        
+        int64_t start_time = butil::monotonic_time_ms();
 
     PeerId peer_id;
     if (0 != peer_id.parse(request->peer_id())) {
@@ -115,8 +117,12 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
         return;
     }
 
-    return node->handle_append_entries_request(cntl, request, response, 
+     node->handle_append_entries_request(cntl, request, response, 
                                                done_guard.release());
+                                                 int64_t elapsed_time = butil::monotonic_time_ms() - start_time;
+  LOG_IF(INFO, elapsed_time > 1000)
+      << "append_entries size: " << request->entries().size()
+      << " elapsed time: " << elapsed_time << " id: " << node->node_id().to_string();;
 }
 
 void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl_base,
