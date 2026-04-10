@@ -18,11 +18,15 @@
 #ifndef BRAFT_RAFT_META_H
 #define BRAFT_RAFT_META_H
 
+#include <atomic>
+#include <memory>
 #include <butil/memory/ref_counted.h>
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 #include <bthread/execution_queue.h>
+#include <bvar/bvar.h>
 #include "braft/storage.h"
+#include "braft/repeated_timer_task.h"
 
 namespace braft {
 
@@ -137,7 +141,7 @@ private:
 };
 
 // Inner class of KVBasedMergedMetaStorage
-class KVBasedMergedMetaStorageImpl : 
+class KVBasedMergedMetaStorageImpl :
             public butil::RefCountedThreadSafe<KVBasedMergedMetaStorageImpl> {
 friend class scoped_refptr<KVBasedMergedMetaStorageImpl>;
 
@@ -146,6 +150,11 @@ public:
         : _is_inited(false), _path(path), _db(nullptr) {}
     KVBasedMergedMetaStorageImpl() {}
     virtual ~KVBasedMergedMetaStorageImpl() {
+        if (_periodic_sync_timer) {
+            _periodic_sync_timer->stop();
+            _periodic_sync_timer->destroy();
+            _periodic_sync_timer->wait_for_destroy();
+        }
         if (_db) {
             delete _db;
             _db = nullptr;
@@ -157,6 +166,7 @@ public:
         int64_t term;
         PeerId votedfor;
         VersionedGroupId vgid;
+        std::string serialized_value;  // pre-serialized protobuf
         Closure* done;
     };
 

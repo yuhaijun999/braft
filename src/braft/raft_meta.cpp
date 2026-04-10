@@ -16,11 +16,13 @@
 //          Xiong,Kai(xiongkai@baidu.com)
 
 #include <errno.h>
+#include <algorithm>
 #include <butil/time.h>
 #include <butil/logging.h>
 #include <butil/file_util.h>                         // butil::CreateDirectory
 #include <gflags/gflags.h>
 #include <brpc/reloadable_flags.h>
+#include <memory>
 #include "braft/util.h"
 #include "braft/protobuf_file.h"
 #include "braft/local_storage.pb.h"
@@ -31,6 +33,19 @@ namespace braft {
 DEFINE_int32(raft_meta_write_batch, 128, 
              "Max number of tasks that can be written into db in a single batch");
 BRPC_VALIDATE_GFLAG(raft_meta_write_batch, brpc::PositiveInteger);
+
+
+DEFINE_bool(raft_meta_force_no_sync, false,
+             "Skip fsync when writing raft metadata. "
+             "Under extreme load, synchronous fsync may take too long and trigger leader election. "
+             "Enabling this flag avoids that by writing to kernel buffer cache only. "
+             "Process crash will NOT lose data, but machine power failure WILL lose unsynced vote records. "
+             "machine power failure will lose unsynced vote records.");
+
+
+// Validator for force_no_sync.
+BRPC_VALIDATE_GFLAG(raft_meta_force_no_sync, brpc::PassValidate);
+
 
 static bvar::LatencyRecorder g_load_pb_raft_meta("raft_load_pb_raft_meta");
 static bvar::LatencyRecorder g_save_pb_raft_meta("raft_save_pb_raft_meta");
@@ -623,6 +638,7 @@ butil::Status KVBasedMergedMetaStorage::delete_meta(
     return _merged_impl->delete_meta(group);
 };
 
+
 // KVBasedMergedMetaStorageImpl
 butil::Status KVBasedMergedMetaStorageImpl::init() {
     std::unique_lock<raft_mutex_t> lck(_mutex); 
@@ -645,7 +661,7 @@ butil::Status KVBasedMergedMetaStorageImpl::init() {
 
     leveldb::Options options;
     options.create_if_missing = true;
-    //options.error_if_exists = true;   
+    //options.error_if_exists = true;
 
     leveldb::Status st;
     st = leveldb::DB::Open(options, _path.c_str(), &_db);
@@ -665,23 +681,28 @@ butil::Status KVBasedMergedMetaStorageImpl::init() {
                                        &execq_opt,
                                        KVBasedMergedMetaStorageImpl::run,
                                        this) != 0) {
-        status.set_error(EINVAL, "Fail to start execution_queue, path: %s", 
+        status.set_error(EINVAL, "Fail to start execution_queue, path: %s",
                          _path.c_str());
         return status;
-    }    
+    }
+
+
+    // Warn about unsafe flag combinations
 
     _is_inited = true;
     return status;
 }
 
-    
+
 void KVBasedMergedMetaStorageImpl::run_tasks(leveldb::WriteBatch& updates, 
                                                Closure* dones[], size_t size) {
     g_save_kv_raft_meta_batch_counter << size; 
     
-    leveldb::WriteOptions options;
-    options.sync = raft_sync_meta(); 
-    leveldb::Status st = _db->Write(options, &updates);
+    leveldb::Status st;
+    bool sync = raft_sync_meta() && (!FLAGS_raft_meta_force_no_sync);
+    leveldb::WriteOptions write_options;
+    write_options.sync = sync;
+    st = _db->Write(write_options, &updates);
     if (!st.ok()) {
         LOG(ERROR) << "Fail to write batch into db, path: " << _path
                    << ", error: " << st.ToString();
@@ -696,51 +717,56 @@ void KVBasedMergedMetaStorageImpl::run_tasks(leveldb::WriteBatch& updates,
     } else {
         for (size_t i = 0; i < size; ++i) {
             run_closure_in_bthread_nosig(dones[i]);
-        } 
+        }
     }
     bthread_flush();
 }
 
-int KVBasedMergedMetaStorageImpl::run(void* meta, 
+int KVBasedMergedMetaStorageImpl::run(void* meta,
                                 bthread::TaskIterator<WriteTask>& iter) {
     if (iter.is_queue_stopped()) {
         return 0;
     }
 
     KVBasedMergedMetaStorageImpl* mss = (KVBasedMergedMetaStorageImpl*)meta;
+    const bool optimized = false;
     const size_t batch_size = FLAGS_raft_meta_write_batch;
-    size_t cur_size = 0;
     leveldb::WriteBatch updates;
     DEFINE_SMALL_ARRAY(Closure*, dones, batch_size, 256);
+    size_t dones_count = 0;
+
+    // Serialize task value: optimized path uses pre-serialized data,
+    // non-optimized path serializes protobuf on the fly.
+    auto put_task = [optimized](leveldb::WriteBatch& batch,
+                                const WriteTask& task) {
+        leveldb::Slice key(task.vgid.data(), task.vgid.size());
+        if (optimized) {
+            leveldb::Slice value(task.serialized_value.data(),
+                                 task.serialized_value.size());
+            batch.Put(key, value);
+        } else {
+            StablePBMeta meta;
+            meta.set_term(task.term);
+            meta.set_votedfor(task.votedfor.to_string());
+            std::string meta_string;
+            meta.SerializeToString(&meta_string);
+            batch.Put(key, leveldb::Slice(meta_string.data(), meta_string.size()));
+        }
+    };
 
     for (; iter; ++iter) {
-        if (cur_size == batch_size) {
-            mss->run_tasks(updates, dones, cur_size); 
+        if (dones_count == batch_size) {
+            mss->run_tasks(updates, dones, dones_count);
             updates.Clear();
-            cur_size = 0;
+            dones_count = 0;
         }
-
-        const int64_t term = iter->term;
-        const PeerId votedfor = iter->votedfor;
-        const VersionedGroupId vgid = iter->vgid;
-        Closure* done = iter->done; 
-        // get key and value 
-        leveldb::Slice key(vgid.data(), vgid.size());  
-        StablePBMeta meta;
-        meta.set_term(term);
-        meta.set_votedfor(votedfor.to_string());
-        std::string meta_string;
-        meta.SerializeToString(&meta_string);
-        leveldb::Slice value(meta_string.data(), meta_string.size());
-
-        updates.Put(key, value);
-        dones[cur_size++] = done;
+        put_task(updates, *iter);
+        dones[dones_count++] = iter->done;
     }
-    if (cur_size > 0) {
-        mss->run_tasks(updates, dones, cur_size);
-        updates.Clear();
-        cur_size = 0;
+    if (dones_count > 0) {
+        mss->run_tasks(updates, dones, dones_count);
     }
+
     return 0;
 }
 
@@ -758,6 +784,7 @@ void KVBasedMergedMetaStorageImpl::set_term_and_votedfor(
     task.votedfor = peer_id;
     task.vgid = group;
     task.done = done;
+
     if (bthread::execution_queue_execute(_queue_id, task) != 0) {
         task.done->status().set_error(EIO, "Failed to put task into queue");
         return run_closure_in_bthread(task.done);
