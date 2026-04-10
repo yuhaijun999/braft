@@ -34,6 +34,19 @@ DEFINE_int32(raft_meta_write_batch, 128,
              "Max number of tasks that can be written into db in a single batch");
 BRPC_VALIDATE_GFLAG(raft_meta_write_batch, brpc::PositiveInteger);
 
+// Warning: This design is predicated on the observation that, under heavy load testing, the time
+// required to synchronously flush `raft_meta` data to disk becomes excessive, potentially
+// triggering a Leader election. Our design is tailored to the following scenarios:
+// 1.  Under heavy load testing, asynchronous disk flushing is employed. Since the data has already
+// been written to the kernel's buffer cache, no data loss occurs even in the event of a process
+// crash; data loss would only result from an unexpected power failure.
+// 2.  When the system load is moderate, the design utilizes asynchronous flushing supplemented by a
+// dedicated background flushing thread (configured by default to flush to disk once per second).
+// 3.  Under very light load conditions, synchronous disk flushing remains enabled.
+// 4.  Ultimately, all these configurations are controlled externally. External system designers do
+// not adjust these parameters arbitrarily; rather, they configure specific parameters tailored to
+// the requirements of each distinct operational scenario.
+
 DEFINE_bool(raft_meta_enable_leveldb_tuning, false,
              "Tune LevelDB options for raft meta DB (write_buffer_size, max_open_files, etc.). "
              "Takes effect only at init() time; cannot be changed at runtime.");
@@ -732,6 +745,13 @@ void MetaPeriodicSyncTimer::run() {
     }
     leveldb::WriteOptions sync_options;
     sync_options.sync = true;
+    // We submit an empty WriteBatch with sync=true to force a WAL fsync without
+    // writing any user data. This relies on LevelDB's behaviour of flushing and
+    // syncing the WAL even for an empty batch when sync=true is set (see
+    // leveldb/db/db_impl.cc, DBImpl::Write). This is not explicitly documented
+    // in the public API, but has been stable across all LevelDB versions we
+    // support. If LevelDB ever skips the sync for empty batches, previously
+    // non-synced writes could be lost on power failure.
     leveldb::WriteBatch empty_batch;
     leveldb::Status st = _db->Write(sync_options, &empty_batch);
     if (!st.ok()) {
@@ -751,7 +771,12 @@ int MetaPeriodicSyncTimer::adjust_timeout_ms(int timeout_ms) {
     if (current > 0) {
         return current;
     }
-    // Flag is 0, fall back to original interval.
+    // Flag is 0: we cannot honour a zero-ms interval (the underlying timer
+    // does not support it), so we fall back to the original interval that was
+    // passed at init() time. The timer keeps firing and run() will still fsync
+    // if dirty=true. Setting this flag to 0 does NOT pause syncing — it is
+    // simply ignored. To stop periodic syncing, restart with
+    // raft_meta_periodic_sync_enabled=false.
     return timeout_ms;
 }
 
@@ -850,6 +875,16 @@ void KVBasedMergedMetaStorageImpl::run_tasks(leveldb::WriteBatch& updates,
     
     leveldb::Status st;
     bool sync = raft_sync_meta() && (!FLAGS_raft_meta_force_no_sync);
+    if (!sync && !FLAGS_raft_meta_periodic_sync_enabled) {
+        LOG_EVERY_N(WARNING, 10000)
+            << "raft meta writes are NOT durable: "
+            << "force_no_sync=" << FLAGS_raft_meta_force_no_sync
+            << ", periodic_sync=" << FLAGS_raft_meta_periodic_sync_enabled
+            << ", raft_sync_meta=" << FLAGS_raft_sync_meta
+            << ". Process crash is safe, but machine power failure "
+            << "will lose unsynced vote records. "
+            << "path: " << _path;
+    }
     leveldb::WriteOptions write_options;
     write_options.sync = sync;
     st = _db->Write(write_options, &updates);
