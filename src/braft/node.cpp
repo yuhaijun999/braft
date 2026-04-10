@@ -33,6 +33,7 @@
 #include "braft/node_manager.h"
 #include "braft/snapshot_executor.h"
 #include "braft/errno.pb.h"
+#include "braft/braft_latency.h"
 
 namespace braft {
 
@@ -69,6 +70,12 @@ DECLARE_bool(raft_enable_leader_lease);
 
 DEFINE_bool(raft_enable_witness_to_leader, false, 
             "enable witness temporarily to become leader when leader down accidently");
+BRPC_VALIDATE_GFLAG(raft_enable_witness_to_leader, ::brpc::PassValidate);
+
+
+DEFINE_bool(raft_latency_log_init, false,
+            "Enable elapsed time logging for NodeImpl::init");
+BRPC_VALIDATE_GFLAG(raft_latency_log_init, brpc::PassValidate);
 
 #ifndef UNIT_TEST
 static bvar::Adder<int64_t> g_num_nodes("raft_node_count");
@@ -489,7 +496,11 @@ int NodeImpl::bootstrap(const BootstrapOptions& options) {
     return 0;
 }
 
+// Warning: It is necessary to add logging for execution time during the initial development phase.
+// Since load testing revealed that the `note init` process takes a significant amount of time, this
+// will provide a foundation for future optimization efforts.
 int NodeImpl::init(const NodeOptions& options) {
+    BRAFT_LATENCY_BEGIN(FLAGS_raft_latency_log_init)
     _options = options;
 
     // check _server_id
@@ -546,12 +557,16 @@ int NodeImpl::init(const NodeOptions& options) {
         _follower_lease.init(options.election_timeout_ms, options.max_clock_drift_ms);
     }
 
+    BRAFT_LATENCY_CONTINUE(before_init_log_storage_time)
+
     // log storage and log manager init
     if (init_log_storage() != 0) {
         LOG(ERROR) << "node " << _group_id << ":" << _server_id
                    << " init_log_storage failed";
         return -1;
     }
+
+    BRAFT_LATENCY_CONTINUE(after_init_log_storage_time)
 
     if (init_fsm_caller(LogId(0, 0)) != 0) {
         LOG(ERROR) << "node " << _group_id << ":" << _server_id
@@ -570,6 +585,8 @@ int NodeImpl::init(const NodeOptions& options) {
         return -1;
     }
 
+    BRAFT_LATENCY_CONTINUE(before_init_snapshot_storage_time)
+
     // snapshot storage init and load
     // NOTE: snapshot maybe discard entries when snapshot saved but not discard entries.
     //      init log storage before snapshot storage, snapshot storage will update configration
@@ -578,6 +595,8 @@ int NodeImpl::init(const NodeOptions& options) {
                    << " init_snapshot_storage failed";
         return -1;
     }
+
+    BRAFT_LATENCY_CONTINUE(after_init_snapshot_storage_time)
 
     butil::Status st = _log_manager->check_consistency();
     if (!st.ok()) {
@@ -595,12 +614,16 @@ int NodeImpl::init(const NodeOptions& options) {
         _conf.conf = _options.initial_conf;
     }
     
+    BRAFT_LATENCY_CONTINUE(before_init_meta_storage_time)
+
     // init meta and check term
     if (init_meta_storage() != 0) {
         LOG(ERROR) << "node " << _group_id << ":" << _server_id
                    << " init_meta_storage failed";
         return -1;
     }
+
+    BRAFT_LATENCY_CONTINUE(after_init_meta_storage_time)
 
     // first start, we can vote directly
     if (_current_term == 1 && _voted_id.is_empty()) {
@@ -658,6 +681,20 @@ int NodeImpl::init(const NodeOptions& options) {
         // the timer immediately.
         elect_self(&lck);
     }
+
+    BRAFT_LATENCY_END(
+            FLAGS_raft_latency_log_threshold_ms,
+            "NodeImpl::init id: "
+                    << _group_id << " server_id: " << _server_id
+                    << " elapsed: " << braft_latency_elapsed << " ms"
+                    << " init_log_storage: "
+                    << (after_init_log_storage_time - before_init_log_storage_time) << " ms"
+                    << " init_snapshot_storage: "
+                    << (after_init_snapshot_storage_time - before_init_snapshot_storage_time) << " ms"
+                    << " init_meta_storage: "
+                    << (after_init_meta_storage_time - before_init_meta_storage_time) << " ms"
+                    << " after_init_meta_storage: "
+                    << (braft_latency_end - after_init_meta_storage_time) << " ms")
 
     return 0;
 }
@@ -2397,7 +2434,6 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
     entries.reserve(request->entries_size());
     brpc::ClosureGuard done_guard(done);
     std::unique_lock<raft_mutex_t> lck(_mutex);
-
     // pre set term, to avoid get term in lock
     response->set_term(_current_term);
 
@@ -2410,7 +2446,6 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                      << " state " << state2str(saved_state);
         cntl->SetFailed(EINVAL, "node %s:%s is not in active state, state %s", 
                 _group_id.c_str(), _server_id.to_string().c_str(), state2str(saved_state));
-        return;
     }
 
     PeerId server_id;
@@ -2422,7 +2457,6 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         cntl->SetFailed(brpc::EREQUEST,
                         "Fail to parse server_id `%s'",
                         request->server_id().c_str());
-        return;
     }
 
     // check stale term
@@ -2435,12 +2469,11 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                      << " current_term " << saved_current_term;
         response->set_success(false);
         response->set_term(saved_current_term);
-        return;
     }
 
     // check term and state to step down
-    check_step_down(request->term(), server_id);   
-     
+    check_step_down(request->term(), server_id);
+
     if (server_id != _leader_id) {
         LOG(ERROR) << "Another peer " << _group_id << ":" << server_id
                    << " declares that it is the leader at term=" << _current_term 
@@ -2452,7 +2485,6 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         step_down(request->term() + 1, false, status);
         response->set_success(false);
         response->set_term(request->term() + 1);
-        return;
     }
 
     if (!from_append_entries_cache) {
@@ -2466,12 +2498,13 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
                      << " received append entries while installing snapshot";
         cntl->SetFailed(EBUSY, "Is installing snapshot");
-        return;
     }
 
     const int64_t prev_log_index = request->prev_log_index();
     const int64_t prev_log_term = request->prev_log_term();
+
     const int64_t local_prev_log_term = _log_manager->get_term(prev_log_index);
+
     if (local_prev_log_term != prev_log_term) {
         int64_t last_index = _log_manager->last_log_index();
         int64_t saved_term = request->term();
@@ -2493,8 +2526,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                          << " local_prev_log_term " << local_prev_log_term
                          << " last_log_index " << last_index
                          << " entries_size " << saved_entries_size;
-            return;
-        }
+            }
 
         response->set_success(false);
         response->set_term(_current_term);
@@ -2512,7 +2544,6 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                          << " entries_size " << request->entries_size()
                          << " from_append_entries_cache: " << from_append_entries_cache;
         }
-        return;
     }
 
     if (request->entries_size() == 0) {
@@ -2525,7 +2556,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         _ballot_box->set_last_committed_index(
                 std::min(request->committed_index(),
                          prev_log_index));
-        return;
+
     }
 
     // Parse request
@@ -2574,6 +2605,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
 
     // update configuration after _log_manager updated its memory status
     _log_manager->check_and_set_configuration(&_conf);
+
 }
 
 int NodeImpl::increase_term_to(int64_t new_term, const butil::Status& status) {
