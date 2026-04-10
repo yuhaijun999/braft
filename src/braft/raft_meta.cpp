@@ -34,6 +34,25 @@ DEFINE_int32(raft_meta_write_batch, 128,
              "Max number of tasks that can be written into db in a single batch");
 BRPC_VALIDATE_GFLAG(raft_meta_write_batch, brpc::PositiveInteger);
 
+DEFINE_bool(raft_meta_enable_leveldb_tuning, false,
+             "Tune LevelDB options for raft meta DB (write_buffer_size, max_open_files, etc.). "
+             "Takes effect only at init() time; cannot be changed at runtime.");
+// LevelDB options are applied once during DB::Open, runtime changes have no effect.
+static bool validate_raft_meta_enable_leveldb_tuning(const char*, bool val) {
+    if (val != FLAGS_raft_meta_enable_leveldb_tuning) {
+        LOG(ERROR) << "raft_meta_enable_leveldb_tuning cannot be changed at runtime. "
+                   << "LevelDB options are applied only during init(). "
+                   << "Please set this flag at startup.";
+        return false;
+    }
+    return true;
+}
+BRPC_VALIDATE_GFLAG(raft_meta_enable_leveldb_tuning, validate_raft_meta_enable_leveldb_tuning);
+
+DEFINE_bool(raft_meta_enable_preserialize, false,
+             "Pre-serialize protobuf in set_term_and_votedfor() before submitting to the "
+             "execution queue, moving CPU work out of the queue handler hot path.");
+BRPC_VALIDATE_GFLAG(raft_meta_enable_preserialize, brpc::PassValidate);
 
 DEFINE_bool(raft_meta_force_no_sync, false,
              "Skip fsync when writing raft metadata. "
@@ -760,6 +779,15 @@ butil::Status KVBasedMergedMetaStorageImpl::init() {
     options.create_if_missing = true;
     //options.error_if_exists = true;
 
+    if (FLAGS_raft_meta_enable_leveldb_tuning) {
+        // Raft meta DB stores tiny KV pairs (term+votedfor per group),
+        // tune for minimal I/O and compaction overhead.
+        options.write_buffer_size = 1 * 1024 * 1024;   // 1MB, enough for meta
+        options.max_open_files = 64;                    // tiny DB needs few fds
+        options.max_file_size = 1 * 1024 * 1024;        // 1MB sstable
+        options.compression = leveldb::kNoCompression;  // values too small to benefit
+    }
+
     leveldb::Status st;
     st = leveldb::DB::Open(options, _path.c_str(), &_db);
     if (!st.ok()) {
@@ -854,7 +882,7 @@ int KVBasedMergedMetaStorageImpl::run(void* meta,
     }
 
     KVBasedMergedMetaStorageImpl* mss = (KVBasedMergedMetaStorageImpl*)meta;
-    const bool optimized = false;
+    const bool optimized = FLAGS_raft_meta_enable_preserialize;
     const size_t batch_size = FLAGS_raft_meta_write_batch;
     leveldb::WriteBatch updates;
     DEFINE_SMALL_ARRAY(Closure*, dones, batch_size, 256);
@@ -909,6 +937,13 @@ void KVBasedMergedMetaStorageImpl::set_term_and_votedfor(
     task.votedfor = peer_id;
     task.vgid = group;
     task.done = done;
+    if (FLAGS_raft_meta_enable_preserialize) {
+        // Pre-serialize protobuf to reduce CPU work inside execution queue handler
+        StablePBMeta meta;
+        meta.set_term(term);
+        meta.set_votedfor(peer_id.to_string());
+        meta.SerializeToString(&task.serialized_value);
+    }
 
     if (bthread::execution_queue_execute(_queue_id, task) != 0) {
         task.done->status().set_error(EIO, "Failed to put task into queue");
