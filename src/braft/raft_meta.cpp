@@ -40,12 +40,53 @@ DEFINE_bool(raft_meta_force_no_sync, false,
              "Under extreme load, synchronous fsync may take too long and trigger leader election. "
              "Enabling this flag avoids that by writing to kernel buffer cache only. "
              "Process crash will NOT lose data, but machine power failure WILL lose unsynced vote records. "
-             "machine power failure will lose unsynced vote records.");
+             "Recommend enabling raft_meta_periodic_sync_enabled=true together.");
 
+DEFINE_bool(raft_meta_periodic_sync_enabled, false,
+             "Enable background periodic fsync for raft meta DB. "
+             "When enabled, normal writes use sync=false for performance, and "
+             "a background timer ensures data is fsynced periodically. "
+             "Note: there is still a data loss window (up to raft_meta_periodic_sync_interval_ms) "
+             "on machine power failure between two fsyncs.");
 
-// Validator for force_no_sync.
-BRPC_VALIDATE_GFLAG(raft_meta_force_no_sync, brpc::PassValidate);
+// raft_meta_periodic_sync_enabled is read only at init() time to decide whether
+// to create the background sync timer.  Changing it at runtime has no effect
+// because the timer is not created/destroyed dynamically, so we reject any
+// runtime modification to avoid giving users a false sense of control.
+static bool validate_raft_meta_periodic_sync_enabled(const char*, bool val) {
+    if (val != FLAGS_raft_meta_periodic_sync_enabled) {
+        LOG(ERROR) << "raft_meta_periodic_sync_enabled cannot be changed at runtime. "
+                   << "The periodic sync timer is created only during init(). "
+                   << "Please set this flag at startup.";
+        return false;
+    }
+    return true;
+}
+BRPC_VALIDATE_GFLAG(raft_meta_periodic_sync_enabled, validate_raft_meta_periodic_sync_enabled);
 
+// Validator for force_no_sync: placed after periodic_sync_enabled so the flag is visible.
+static bool validate_raft_meta_force_no_sync(const char*, bool val) {
+    if (val && !FLAGS_raft_meta_periodic_sync_enabled) {
+        LOG(WARNING) << "raft_meta_force_no_sync is being set to true "
+                     << "while raft_meta_periodic_sync_enabled=false. "
+                     << "This silently overrides raft_sync/raft_sync_meta and "
+                     << "leaves writes non-durable against power failure. "
+                     << "Consider enabling raft_meta_periodic_sync_enabled.";
+    }
+    return true;  // always allow, just warn
+}
+BRPC_VALIDATE_GFLAG(raft_meta_force_no_sync, validate_raft_meta_force_no_sync);
+
+DEFINE_int32(raft_meta_periodic_sync_interval_ms, 1000,
+             "Interval (ms) for periodic fsync when raft_meta_periodic_sync_enabled "
+             "is true. Default 1000 (1 second). "
+             "NOTE: setting this to 0 at runtime does NOT pause syncing — the timer "
+             "continues to fire at its original interval and dirty writes are still "
+             "fsynced. To actually stop periodic syncing the process must be restarted "
+             "with raft_meta_periodic_sync_enabled=false. "
+             "Smaller values reduce the data loss window on power failure "
+             "but increase I/O overhead.");
+BRPC_VALIDATE_GFLAG(raft_meta_periodic_sync_interval_ms, brpc::NonNegativeInteger);
 
 static bvar::LatencyRecorder g_load_pb_raft_meta("raft_load_pb_raft_meta");
 static bvar::LatencyRecorder g_save_pb_raft_meta("raft_save_pb_raft_meta");
@@ -638,6 +679,62 @@ butil::Status KVBasedMergedMetaStorage::delete_meta(
     return _merged_impl->delete_meta(group);
 };
 
+// MetaPeriodicSyncTimer
+static int64_t get_data_loss_window_ms(void* arg) {
+    MetaPeriodicSyncTimer* timer = static_cast<MetaPeriodicSyncTimer*>(arg);
+    int64_t last_sync = timer->last_sync_time_ms();
+    if (last_sync == 0) {
+        // Never synced yet, return -1 to indicate unknown
+        return -1;
+    }
+    return butil::monotonic_time_ms() - last_sync;
+}
+
+MetaPeriodicSyncTimer::MetaPeriodicSyncTimer(leveldb::DB* db, const std::string& path)
+    : _db(db), _path(path), _dirty(false), _last_sync_time_ms(0) {
+    // Initialize bvar metrics with path-specific names to support multiple instances
+    std::string prefix = "raft_meta_periodic_sync_" + path;
+    // Replace '/' with '_' to make valid bvar names
+    std::replace(prefix.begin(), prefix.end(), '/', '_');
+
+    _sync_success_count = std::make_unique<bvar::Adder<int64_t>>(prefix + "_success");
+    _sync_failure_count = std::make_unique<bvar::Adder<int64_t>>(prefix + "_failure");
+    _data_loss_window_ms = std::make_unique<bvar::PassiveStatus<int64_t>>(
+        prefix + "_data_loss_window_ms", get_data_loss_window_ms, this);
+}
+
+MetaPeriodicSyncTimer::~MetaPeriodicSyncTimer() {
+    // unique_ptr will auto-cleanup bvar metrics
+}
+
+void MetaPeriodicSyncTimer::run() {
+    if (!_dirty.exchange(false, std::memory_order_acq_rel)) {
+        return;
+    }
+    leveldb::WriteOptions sync_options;
+    sync_options.sync = true;
+    leveldb::WriteBatch empty_batch;
+    leveldb::Status st = _db->Write(sync_options, &empty_batch);
+    if (!st.ok()) {
+        LOG(WARNING) << "Periodic sync failed for meta db, path: " << _path
+                     << ", error: " << st.ToString();
+        // Restore dirty flag so next timer tick will retry
+        _dirty.store(true, std::memory_order_release);
+        (*_sync_failure_count) << 1;
+    } else {
+        _last_sync_time_ms.store(butil::monotonic_time_ms(), std::memory_order_release);
+        (*_sync_success_count) << 1;
+    }
+}
+
+int MetaPeriodicSyncTimer::adjust_timeout_ms(int timeout_ms) {
+    const int current = FLAGS_raft_meta_periodic_sync_interval_ms;
+    if (current > 0) {
+        return current;
+    }
+    // Flag is 0, fall back to original interval.
+    return timeout_ms;
+}
 
 // KVBasedMergedMetaStorageImpl
 butil::Status KVBasedMergedMetaStorageImpl::init() {
@@ -686,8 +783,33 @@ butil::Status KVBasedMergedMetaStorageImpl::init() {
         return status;
     }
 
+    // Start periodic sync timer if enabled
+    if (FLAGS_raft_meta_periodic_sync_enabled) {
+        _periodic_sync_timer = std::make_unique<MetaPeriodicSyncTimer>(_db, _path);
+        if (_periodic_sync_timer->init(FLAGS_raft_meta_periodic_sync_interval_ms) != 0) {
+            LOG(ERROR) << "Fail to init periodic sync timer, path: " << _path;
+            _periodic_sync_timer.reset();
+            status.set_error(EINVAL, "Fail to init periodic sync timer, path: %s",
+                         _path.c_str());
+            return status;
+        } else {
+            _periodic_sync_timer->start();
+            LOG(INFO) << "Started periodic meta sync timer, interval_ms: "
+                      << FLAGS_raft_meta_periodic_sync_interval_ms
+                      << ", path: " << _path;
+        }
+    }
 
     // Warn about unsafe flag combinations
+    if (FLAGS_raft_meta_force_no_sync && !FLAGS_raft_meta_periodic_sync_enabled) {
+        LOG(WARNING) << "UNSAFE CONFIG: raft_meta_force_no_sync=true but "
+                     << "raft_meta_periodic_sync_enabled=false. "
+                     << "Writes go to kernel buffer cache only, "
+                     << "process crash is safe but machine power failure "
+                     << "will lose unsynced vote records. "
+                     << "Recommend enabling raft_meta_periodic_sync_enabled=true. "
+                     << "path: " << _path;
+    }
 
     _is_inited = true;
     return status;
@@ -715,6 +837,9 @@ void KVBasedMergedMetaStorageImpl::run_tasks(leveldb::WriteBatch& updates,
             run_closure_in_bthread_nosig(dones[i]);
         }
     } else {
+        if (_periodic_sync_timer && !sync) {
+            _periodic_sync_timer->mark_dirty();
+        }
         for (size_t i = 0; i < size; ++i) {
             run_closure_in_bthread_nosig(dones[i]);
         }
