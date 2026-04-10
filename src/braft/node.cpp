@@ -72,6 +72,10 @@ DEFINE_bool(raft_enable_witness_to_leader, false,
             "enable witness temporarily to become leader when leader down accidently");
 BRPC_VALIDATE_GFLAG(raft_enable_witness_to_leader, ::brpc::PassValidate);
 
+DEFINE_bool(raft_latency_log_handle_append_entries, false,
+            "Enable elapsed time logging for handle_append_entries_request");
+BRPC_VALIDATE_GFLAG(raft_latency_log_handle_append_entries,
+                    brpc::PassValidate);
 
 DEFINE_bool(raft_latency_log_init, false,
             "Enable elapsed time logging for NodeImpl::init");
@@ -2430,10 +2434,12 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              AppendEntriesResponse* response,
                                              google::protobuf::Closure* done,
                                              bool from_append_entries_cache) {
+    BRAFT_LATENCY_BEGIN(FLAGS_raft_latency_log_handle_append_entries)
     std::vector<LogEntry*> entries;
     entries.reserve(request->entries_size());
     brpc::ClosureGuard done_guard(done);
     std::unique_lock<raft_mutex_t> lck(_mutex);
+    BRAFT_LATENCY_CONTINUE(mutex_time)
     // pre set term, to avoid get term in lock
     response->set_term(_current_term);
 
@@ -2446,6 +2452,12 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                      << " state " << state2str(saved_state);
         cntl->SetFailed(EINVAL, "node %s:%s is not in active state, state %s", 
                 _group_id.c_str(), _server_id.to_string().c_str(), state2str(saved_state));
+        BRAFT_LATENCY_END(FLAGS_raft_latency_log_threshold_ms,
+                "NodeImpl::handle_append_entries_request rejected(not_active)"
+                << " elapsed: " << braft_latency_elapsed << " ms"
+                << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                << " id: " << this->node_id().to_string())
+        return;
     }
 
     PeerId server_id;
@@ -2457,6 +2469,12 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         cntl->SetFailed(brpc::EREQUEST,
                         "Fail to parse server_id `%s'",
                         request->server_id().c_str());
+        BRAFT_LATENCY_END(FLAGS_raft_latency_log_threshold_ms,
+                "NodeImpl::handle_append_entries_request rejected(bad_server_id)"
+                << " elapsed: " << braft_latency_elapsed << " ms"
+                << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                << " id: " << this->node_id().to_string())
+        return;
     }
 
     // check stale term
@@ -2469,10 +2487,18 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                      << " current_term " << saved_current_term;
         response->set_success(false);
         response->set_term(saved_current_term);
+        BRAFT_LATENCY_END(FLAGS_raft_latency_log_threshold_ms,
+                "NodeImpl::handle_append_entries_request rejected(stale_term)"
+                << " elapsed: " << braft_latency_elapsed << " ms"
+                << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                << " id: " << this->node_id().to_string())
+        return;
     }
 
+    BRAFT_LATENCY_CONTINUE(before_check_step_down_time)
     // check term and state to step down
     check_step_down(request->term(), server_id);
+    BRAFT_LATENCY_CONTINUE(after_check_step_down_time)
 
     if (server_id != _leader_id) {
         LOG(ERROR) << "Another peer " << _group_id << ":" << server_id
@@ -2485,6 +2511,13 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         step_down(request->term() + 1, false, status);
         response->set_success(false);
         response->set_term(request->term() + 1);
+        BRAFT_LATENCY_END(FLAGS_raft_latency_log_threshold_ms,
+                "NodeImpl::handle_append_entries_request rejected(leader_conflict)"
+                << " elapsed: " << braft_latency_elapsed << " ms"
+                << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                << " step_down: " << (after_check_step_down_time - before_check_step_down_time) << " ms"
+                << " id: " << this->node_id().to_string())
+        return;
     }
 
     if (!from_append_entries_cache) {
@@ -2498,12 +2531,21 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
                      << " received append entries while installing snapshot";
         cntl->SetFailed(EBUSY, "Is installing snapshot");
+        BRAFT_LATENCY_END(FLAGS_raft_latency_log_threshold_ms,
+                "NodeImpl::handle_append_entries_request rejected(installing_snapshot)"
+                << " elapsed: " << braft_latency_elapsed << " ms"
+                << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                << " step_down: " << (after_check_step_down_time - before_check_step_down_time) << " ms"
+                << " id: " << this->node_id().to_string())
+        return;
     }
 
     const int64_t prev_log_index = request->prev_log_index();
     const int64_t prev_log_term = request->prev_log_term();
 
+    BRAFT_LATENCY_CONTINUE(before_get_term_time)
     const int64_t local_prev_log_term = _log_manager->get_term(prev_log_index);
+    BRAFT_LATENCY_CONTINUE(after_get_term_time)
 
     if (local_prev_log_term != prev_log_term) {
         int64_t last_index = _log_manager->last_log_index();
@@ -2526,7 +2568,15 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                          << " local_prev_log_term " << local_prev_log_term
                          << " last_log_index " << last_index
                          << " entries_size " << saved_entries_size;
-            }
+            BRAFT_LATENCY_END(FLAGS_raft_latency_log_threshold_ms,
+                    "NodeImpl::handle_append_entries_request rejected(out_of_order_cached)"
+                    << " elapsed: " << braft_latency_elapsed << " ms"
+                    << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                    << " step_down: " << (after_check_step_down_time - before_check_step_down_time) << " ms"
+                    << " get_term: " << (after_get_term_time - before_get_term_time) << " ms"
+                    << " id: " << this->node_id().to_string())
+            return;
+        }
 
         response->set_success(false);
         response->set_term(_current_term);
@@ -2544,6 +2594,14 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                          << " entries_size " << request->entries_size()
                          << " from_append_entries_cache: " << from_append_entries_cache;
         }
+        BRAFT_LATENCY_END(FLAGS_raft_latency_log_threshold_ms,
+                "NodeImpl::handle_append_entries_request rejected(term_unmatched)"
+                << " elapsed: " << braft_latency_elapsed << " ms"
+                << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                << " step_down: " << (after_check_step_down_time - before_check_step_down_time) << " ms"
+                << " get_term: " << (after_get_term_time - before_get_term_time) << " ms"
+                << " id: " << this->node_id().to_string())
+        return;
     }
 
     if (request->entries_size() == 0) {
@@ -2557,6 +2615,16 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                 std::min(request->committed_index(),
                          prev_log_index));
 
+        BRAFT_LATENCY_END(
+                FLAGS_raft_latency_log_threshold_ms, "NodeImpl::handle_append_entries_request size: "
+                              << request->entries().size()
+                              << " elapsed: " << braft_latency_elapsed << " ms"
+                              << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                              << " step_down: "
+                              << (after_check_step_down_time - before_check_step_down_time) << " ms"
+                              << " get_term: " << (after_get_term_time - before_get_term_time)
+                              << " ms" << " id: " << this->node_id().to_string())
+        return;
     }
 
     // Parse request
@@ -2606,6 +2674,15 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
     // update configuration after _log_manager updated its memory status
     _log_manager->check_and_set_configuration(&_conf);
 
+    BRAFT_LATENCY_END(
+            FLAGS_raft_latency_log_threshold_ms,
+            "NodeImpl::handle_append_entries_request size: "
+                    << request->entries().size() << " elapsed: " << braft_latency_elapsed << " ms"
+                    << " mutex: " << (mutex_time - braft_latency_start) << " ms"
+                    << " step_down: " << (after_check_step_down_time - before_check_step_down_time)
+                    << " ms" << " get_term: " << (after_get_term_time - before_get_term_time)
+                    << " ms" << " entries: " << (braft_latency_end - after_get_term_time) << " ms"
+                    << " id: " << this->node_id().to_string())
 }
 
 int NodeImpl::increase_term_to(int64_t new_term, const butil::Status& status) {
