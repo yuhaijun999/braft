@@ -24,7 +24,7 @@ endif()
 file(GLOB TEST_BRAFT_SRCS "test_*.cpp")
 foreach(BRAFT_UT ${TEST_BRAFT_SRCS})
     get_filename_component(BRAFT_UT_WE ${BRAFT_UT} NAME_WE)
-    add_executable(${BRAFT_UT_WE} ${BRAFT_UT} 
+    add_executable(${BRAFT_UT_WE} ${BRAFT_UT}
                    $<TARGET_OBJECTS:OBJ_LIB>)
     target_link_libraries(${BRAFT_UT_WE}
         #"-Xlinker \"-(\""
@@ -35,3 +35,9 @@ foreach(BRAFT_UT ${TEST_BRAFT_SRCS})
                           #                  "-Xlinker \"-)\""
                           )
 endforeach()
+
+# test_braft_latency does not require -Dprivate=public hack and is
+# compatible with newer abseil headers, so remove those flags for it.
+set_target_properties(test_braft_latency PROPERTIES
+    COMPILE_FLAGS "-Uprivate -Uprotected"
+)

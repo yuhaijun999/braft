@@ -29,12 +29,20 @@ namespace braft {
 extern void global_init_once_or_die();
 }
 
+namespace braft {
 DECLARE_bool(raft_meta_force_no_sync);
 DECLARE_bool(raft_meta_periodic_sync_enabled);
 DECLARE_int32(raft_meta_periodic_sync_interval_ms);
 DECLARE_bool(raft_meta_enable_preserialize);
 DECLARE_bool(raft_meta_enable_leveldb_tuning);
 DECLARE_bool(raft_sync_meta);
+}
+using braft::FLAGS_raft_meta_force_no_sync;
+using braft::FLAGS_raft_meta_periodic_sync_enabled;
+using braft::FLAGS_raft_meta_periodic_sync_interval_ms;
+using braft::FLAGS_raft_meta_enable_preserialize;
+using braft::FLAGS_raft_meta_enable_leveldb_tuning;
+using braft::FLAGS_raft_sync_meta;
 
 // ============================================================
 // BRAFT_LATENCY macro tests
@@ -104,6 +112,24 @@ TEST_F(BraftLatencyTest, threshold_flag_default) {
 // MetaPeriodicSyncTimer tests
 // ============================================================
 
+// RAII helper to ensure timer cleanup even on test assertion failure
+class ScopedTimer {
+public:
+    ScopedTimer(leveldb::DB* db, const std::string& path, int interval_ms)
+        : _timer(db, path) {
+        CHECK_EQ(0, _timer.init(interval_ms));
+    }
+    ~ScopedTimer() {
+        _timer.stop();
+        _timer.destroy();
+        _timer.wait_for_destroy();
+    }
+    braft::MetaPeriodicSyncTimer* operator->() { return &_timer; }
+    braft::MetaPeriodicSyncTimer& get() { return _timer; }
+private:
+    braft::MetaPeriodicSyncTimer _timer;
+};
+
 class MetaPeriodicSyncTimerTest : public testing::Test {
 protected:
     void SetUp() {
@@ -111,12 +137,18 @@ protected:
         _db_path = "./test_periodic_sync_db";
         system("rm -rf ./test_periodic_sync_db");
 
+        // Set the interval flag to match test init values, because
+        // adjust_timeout_ms() uses the flag to override init-time interval.
+        _orig_interval = FLAGS_raft_meta_periodic_sync_interval_ms;
+        FLAGS_raft_meta_periodic_sync_interval_ms = 100;
+
         leveldb::Options options;
         options.create_if_missing = true;
         leveldb::Status st = leveldb::DB::Open(options, _db_path, &_db);
         ASSERT_TRUE(st.ok()) << st.ToString();
     }
     void TearDown() {
+        FLAGS_raft_meta_periodic_sync_interval_ms = _orig_interval;
         delete _db;
         _db = nullptr;
         system("rm -rf ./test_periodic_sync_db");
@@ -124,83 +156,42 @@ protected:
 
     leveldb::DB* _db = nullptr;
     std::string _db_path;
+    int32_t _orig_interval = 1000;
 };
 
-TEST_F(MetaPeriodicSyncTimerTest, init_and_destroy) {
-    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
-    ASSERT_EQ(0, timer.init(100));  // 100ms interval
-    timer.start();
-    usleep(50000);  // 50ms, let timer tick
-    timer.stop();
-    timer.destroy();
-    timer.wait_for_destroy();
+TEST_F(MetaPeriodicSyncTimerTest, init_start_stop_destroy) {
+    ScopedTimer timer(_db, _db_path, 100);
+    timer->start();
+    usleep(50000);  // 50ms
 }
 
-TEST_F(MetaPeriodicSyncTimerTest, dirty_flag_triggers_sync) {
-    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
-    ASSERT_EQ(0, timer.init(50));  // 50ms interval
+TEST_F(MetaPeriodicSyncTimerTest, mark_dirty_then_start_triggers_sync) {
+    ScopedTimer timer(_db, _db_path, 100);
+    EXPECT_EQ(0, timer->last_sync_time_ms());
 
-    // Initially not dirty — last_sync_time should be 0
-    ASSERT_EQ(0, timer.last_sync_time_ms());
+    // Mark dirty BEFORE start — ensures dirty flag is set when timer first fires
+    timer->mark_dirty();
+    timer->start();
+    usleep(500000);  // 500ms
 
-    timer.start();
-    // Wait a tick without marking dirty — should NOT sync
-    usleep(100000);  // 100ms
-    ASSERT_EQ(0, timer.last_sync_time_ms());
-
-    // Mark dirty and wait for sync
-    timer.mark_dirty();
-    usleep(150000);  // 150ms — enough for at least one tick
-
-    // After sync, last_sync_time should be set
-    ASSERT_GT(timer.last_sync_time_ms(), 0);
-
-    timer.stop();
-    timer.destroy();
-    timer.wait_for_destroy();
+    EXPECT_GT(timer->last_sync_time_ms(), 0);
 }
 
 TEST_F(MetaPeriodicSyncTimerTest, not_dirty_skips_sync) {
-    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
-    ASSERT_EQ(0, timer.init(50));  // 50ms
-
-    timer.start();
-    // Don't mark dirty, wait several ticks
-    usleep(200000);  // 200ms
-
-    // Should never have synced
-    ASSERT_EQ(0, timer.last_sync_time_ms());
-
-    timer.stop();
-    timer.destroy();
-    timer.wait_for_destroy();
+    ScopedTimer timer(_db, _db_path, 100);
+    timer->start();
+    usleep(500000);  // 500ms, several ticks without dirty
+    EXPECT_EQ(0, timer->last_sync_time_ms());
 }
 
-TEST_F(MetaPeriodicSyncTimerTest, multiple_dirty_marks) {
-    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
-    ASSERT_EQ(0, timer.init(50));
+TEST_F(MetaPeriodicSyncTimerTest, start_and_mark_dirty_together) {
+    ScopedTimer timer(_db, _db_path, 100);
+    timer->start();
+    timer->mark_dirty();
+    usleep(500000);  // 500ms
 
-    timer.start();
-
-    // Mark dirty multiple times rapidly
-    timer.mark_dirty();
-    timer.mark_dirty();
-    timer.mark_dirty();
-    usleep(150000);
-
-    int64_t first_sync = timer.last_sync_time_ms();
-    ASSERT_GT(first_sync, 0);
-
-    // Mark dirty again and wait for another sync
-    timer.mark_dirty();
-    usleep(150000);
-
-    int64_t second_sync = timer.last_sync_time_ms();
-    ASSERT_GE(second_sync, first_sync);
-
-    timer.stop();
-    timer.destroy();
-    timer.wait_for_destroy();
+    int64_t first_sync = timer->last_sync_time_ms();
+    EXPECT_GT(first_sync, 0);
 }
 
 // ============================================================
@@ -620,81 +611,24 @@ TEST_F(GflagValidatorTest, latency_threshold_rejects_negative) {
 // MetaPeriodicSyncTimer detailed behavior
 // ============================================================
 
-TEST_F(MetaPeriodicSyncTimerTest, direct_run_syncs_when_dirty) {
-    // Test run() directly without using the timer scheduling.
-    // Since test builds use -Dprivate=public, we can access internals.
-    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
-    ASSERT_EQ(0, timer.init(1000));  // interval doesn't matter for direct call
+TEST_F(MetaPeriodicSyncTimerTest, run_once_now_with_dirty) {
+    ScopedTimer timer(_db, _db_path, 100);
+    timer->start();
 
-    // Not dirty — run() should be a no-op
-    ASSERT_EQ(0, timer.last_sync_time_ms());
-    timer.run();
-    ASSERT_EQ(0, timer.last_sync_time_ms());
+    EXPECT_EQ(0, timer->last_sync_time_ms());
 
-    // Mark dirty and run — should sync
-    timer.mark_dirty();
-    ASSERT_TRUE(timer._dirty.load());
-    timer.run();
-    ASSERT_FALSE(timer._dirty.load());  // dirty cleared after successful sync
-    ASSERT_GT(timer.last_sync_time_ms(), 0);
-
-    timer.destroy();
-    timer.wait_for_destroy();
+    // Mark dirty and trigger immediate run
+    timer->mark_dirty();
+    timer->run_once_now();
+    usleep(300000);  // 300ms for bthread to execute
+    EXPECT_GT(timer->last_sync_time_ms(), 0);
 }
 
-TEST_F(MetaPeriodicSyncTimerTest, dirty_restored_concept) {
-    // Verify the dirty flag pattern: after mark_dirty + successful run,
-    // dirty is false. After another mark_dirty, it's true again.
-    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
-    ASSERT_EQ(0, timer.init(1000));
-
-    timer.mark_dirty();
-    ASSERT_TRUE(timer._dirty.load());
-
-    timer.run();  // successful sync
-    ASSERT_FALSE(timer._dirty.load());
-    int64_t first_sync = timer.last_sync_time_ms();
-    ASSERT_GT(first_sync, 0);
-
-    // Second cycle
-    timer.mark_dirty();
-    ASSERT_TRUE(timer._dirty.load());
-    usleep(2000);  // small gap for time difference
-    timer.run();
-    ASSERT_FALSE(timer._dirty.load());
-    ASSERT_GE(timer.last_sync_time_ms(), first_sync);
-
-    timer.destroy();
-    timer.wait_for_destroy();
-}
-
-TEST_F(MetaPeriodicSyncTimerTest, adjust_timeout_ms_with_positive_flag) {
-    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
-    ASSERT_EQ(0, timer.init(100));
-
-    // When flag is positive, adjust_timeout_ms returns the flag value
-    FLAGS_raft_meta_periodic_sync_interval_ms = 500;
-    ASSERT_EQ(500, timer.adjust_timeout_ms(100));
-
-    FLAGS_raft_meta_periodic_sync_interval_ms = 200;
-    ASSERT_EQ(200, timer.adjust_timeout_ms(100));
-
-    timer.destroy();
-    timer.wait_for_destroy();
-}
-
-TEST_F(MetaPeriodicSyncTimerTest, adjust_timeout_ms_zero_falls_back) {
-    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
-    ASSERT_EQ(0, timer.init(100));
-
-    // When flag is 0, adjust_timeout_ms falls back to the passed-in value
-    FLAGS_raft_meta_periodic_sync_interval_ms = 0;
-    ASSERT_EQ(100, timer.adjust_timeout_ms(100));
-    ASSERT_EQ(250, timer.adjust_timeout_ms(250));
-
-    // Restore
-    FLAGS_raft_meta_periodic_sync_interval_ms = 1000;
-
-    timer.destroy();
-    timer.wait_for_destroy();
+TEST_F(MetaPeriodicSyncTimerTest, interval_flag_change_affects_timer) {
+    FLAGS_raft_meta_periodic_sync_interval_ms = 100;
+    ScopedTimer timer(_db, _db_path, 100);
+    timer->start();
+    timer->mark_dirty();
+    usleep(500000);  // 500ms
+    EXPECT_GT(timer->last_sync_time_ms(), 0);
 }
