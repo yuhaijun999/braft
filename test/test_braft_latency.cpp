@@ -498,3 +498,203 @@ TEST_F(EmptyWriteBatchSyncTest, data_survives_empty_sync_batch) {
     ASSERT_TRUE(_db->Get(leveldb::ReadOptions(), "key1", &value).ok());
     ASSERT_EQ("value1", value);
 }
+
+// ============================================================
+// gflags validator tests
+// ============================================================
+
+class GflagValidatorTest : public testing::Test {
+protected:
+    void SetUp() {
+        braft::global_init_once_or_die();
+        // Save original values
+        _orig_leveldb_tuning = FLAGS_raft_meta_enable_leveldb_tuning;
+        _orig_periodic_sync = FLAGS_raft_meta_periodic_sync_enabled;
+        _orig_force_no_sync = FLAGS_raft_meta_force_no_sync;
+        _orig_interval = FLAGS_raft_meta_periodic_sync_interval_ms;
+    }
+    void TearDown() {
+        // Restore via direct assignment (bypasses validator, which is fine in tests)
+        FLAGS_raft_meta_enable_leveldb_tuning = _orig_leveldb_tuning;
+        FLAGS_raft_meta_periodic_sync_enabled = _orig_periodic_sync;
+        FLAGS_raft_meta_force_no_sync = _orig_force_no_sync;
+        FLAGS_raft_meta_periodic_sync_interval_ms = _orig_interval;
+    }
+
+    bool _orig_leveldb_tuning;
+    bool _orig_periodic_sync;
+    bool _orig_force_no_sync;
+    int32_t _orig_interval;
+};
+
+TEST_F(GflagValidatorTest, leveldb_tuning_rejects_runtime_change) {
+    // Default is false; trying to change to true at runtime should fail
+    ASSERT_FALSE(FLAGS_raft_meta_enable_leveldb_tuning);
+    std::string result = GFLAGS_NS::SetCommandLineOption(
+        "raft_meta_enable_leveldb_tuning", "true");
+    // SetCommandLineOption returns empty string on failure
+    ASSERT_TRUE(result.empty())
+        << "Validator should reject runtime change of leveldb_tuning";
+    ASSERT_FALSE(FLAGS_raft_meta_enable_leveldb_tuning);
+
+    // Setting to same value (false→false) should succeed (no-op)
+    result = GFLAGS_NS::SetCommandLineOption(
+        "raft_meta_enable_leveldb_tuning", "false");
+    ASSERT_FALSE(result.empty())
+        << "Validator should accept setting same value";
+}
+
+TEST_F(GflagValidatorTest, periodic_sync_enabled_rejects_runtime_change) {
+    // Default is false; trying to change to true at runtime should fail
+    ASSERT_FALSE(FLAGS_raft_meta_periodic_sync_enabled);
+    std::string result = GFLAGS_NS::SetCommandLineOption(
+        "raft_meta_periodic_sync_enabled", "true");
+    ASSERT_TRUE(result.empty())
+        << "Validator should reject runtime change of periodic_sync_enabled";
+    ASSERT_FALSE(FLAGS_raft_meta_periodic_sync_enabled);
+}
+
+TEST_F(GflagValidatorTest, force_no_sync_allows_runtime_change) {
+    // force_no_sync can be changed at runtime (validator always returns true)
+    ASSERT_FALSE(FLAGS_raft_meta_force_no_sync);
+    std::string result = GFLAGS_NS::SetCommandLineOption(
+        "raft_meta_force_no_sync", "true");
+    ASSERT_FALSE(result.empty())
+        << "Validator should allow runtime change of force_no_sync";
+    ASSERT_TRUE(FLAGS_raft_meta_force_no_sync);
+
+    // Change back
+    result = GFLAGS_NS::SetCommandLineOption(
+        "raft_meta_force_no_sync", "false");
+    ASSERT_FALSE(result.empty());
+    ASSERT_FALSE(FLAGS_raft_meta_force_no_sync);
+}
+
+TEST_F(GflagValidatorTest, preserialize_allows_runtime_change) {
+    // preserialize uses PassValidate, so runtime changes should work
+    ASSERT_FALSE(FLAGS_raft_meta_enable_preserialize);
+    std::string result = GFLAGS_NS::SetCommandLineOption(
+        "raft_meta_enable_preserialize", "true");
+    ASSERT_FALSE(result.empty())
+        << "Validator should allow runtime change of preserialize";
+    ASSERT_TRUE(FLAGS_raft_meta_enable_preserialize);
+    // Restore
+    FLAGS_raft_meta_enable_preserialize = false;
+}
+
+TEST_F(GflagValidatorTest, periodic_sync_interval_rejects_negative) {
+    // Uses NonNegativeInteger validator
+    int32_t old_val = FLAGS_raft_meta_periodic_sync_interval_ms;
+    std::string result = GFLAGS_NS::SetCommandLineOption(
+        "raft_meta_periodic_sync_interval_ms", "-1");
+    ASSERT_TRUE(result.empty())
+        << "Validator should reject negative interval";
+    ASSERT_EQ(old_val, FLAGS_raft_meta_periodic_sync_interval_ms);
+
+    // Positive value should work
+    result = GFLAGS_NS::SetCommandLineOption(
+        "raft_meta_periodic_sync_interval_ms", "500");
+    ASSERT_FALSE(result.empty());
+    ASSERT_EQ(500, FLAGS_raft_meta_periodic_sync_interval_ms);
+}
+
+TEST_F(GflagValidatorTest, latency_threshold_rejects_negative) {
+    // raft_latency_log_threshold_ms uses NonNegativeInteger
+    int32_t old_val = FLAGS_raft_latency_log_threshold_ms;
+    std::string result = GFLAGS_NS::SetCommandLineOption(
+        "raft_latency_log_threshold_ms", "-100");
+    ASSERT_TRUE(result.empty())
+        << "Validator should reject negative threshold";
+    ASSERT_EQ(old_val, FLAGS_raft_latency_log_threshold_ms);
+
+    // Zero should be accepted
+    result = GFLAGS_NS::SetCommandLineOption(
+        "raft_latency_log_threshold_ms", "0");
+    ASSERT_FALSE(result.empty());
+    ASSERT_EQ(0, FLAGS_raft_latency_log_threshold_ms);
+    // Restore
+    FLAGS_raft_latency_log_threshold_ms = old_val;
+}
+
+// ============================================================
+// MetaPeriodicSyncTimer detailed behavior
+// ============================================================
+
+TEST_F(MetaPeriodicSyncTimerTest, direct_run_syncs_when_dirty) {
+    // Test run() directly without using the timer scheduling.
+    // Since test builds use -Dprivate=public, we can access internals.
+    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
+    ASSERT_EQ(0, timer.init(1000));  // interval doesn't matter for direct call
+
+    // Not dirty — run() should be a no-op
+    ASSERT_EQ(0, timer.last_sync_time_ms());
+    timer.run();
+    ASSERT_EQ(0, timer.last_sync_time_ms());
+
+    // Mark dirty and run — should sync
+    timer.mark_dirty();
+    ASSERT_TRUE(timer._dirty.load());
+    timer.run();
+    ASSERT_FALSE(timer._dirty.load());  // dirty cleared after successful sync
+    ASSERT_GT(timer.last_sync_time_ms(), 0);
+
+    timer.destroy();
+    timer.wait_for_destroy();
+}
+
+TEST_F(MetaPeriodicSyncTimerTest, dirty_restored_concept) {
+    // Verify the dirty flag pattern: after mark_dirty + successful run,
+    // dirty is false. After another mark_dirty, it's true again.
+    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
+    ASSERT_EQ(0, timer.init(1000));
+
+    timer.mark_dirty();
+    ASSERT_TRUE(timer._dirty.load());
+
+    timer.run();  // successful sync
+    ASSERT_FALSE(timer._dirty.load());
+    int64_t first_sync = timer.last_sync_time_ms();
+    ASSERT_GT(first_sync, 0);
+
+    // Second cycle
+    timer.mark_dirty();
+    ASSERT_TRUE(timer._dirty.load());
+    usleep(2000);  // small gap for time difference
+    timer.run();
+    ASSERT_FALSE(timer._dirty.load());
+    ASSERT_GE(timer.last_sync_time_ms(), first_sync);
+
+    timer.destroy();
+    timer.wait_for_destroy();
+}
+
+TEST_F(MetaPeriodicSyncTimerTest, adjust_timeout_ms_with_positive_flag) {
+    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
+    ASSERT_EQ(0, timer.init(100));
+
+    // When flag is positive, adjust_timeout_ms returns the flag value
+    FLAGS_raft_meta_periodic_sync_interval_ms = 500;
+    ASSERT_EQ(500, timer.adjust_timeout_ms(100));
+
+    FLAGS_raft_meta_periodic_sync_interval_ms = 200;
+    ASSERT_EQ(200, timer.adjust_timeout_ms(100));
+
+    timer.destroy();
+    timer.wait_for_destroy();
+}
+
+TEST_F(MetaPeriodicSyncTimerTest, adjust_timeout_ms_zero_falls_back) {
+    braft::MetaPeriodicSyncTimer timer(_db, _db_path);
+    ASSERT_EQ(0, timer.init(100));
+
+    // When flag is 0, adjust_timeout_ms falls back to the passed-in value
+    FLAGS_raft_meta_periodic_sync_interval_ms = 0;
+    ASSERT_EQ(100, timer.adjust_timeout_ms(100));
+    ASSERT_EQ(250, timer.adjust_timeout_ms(250));
+
+    // Restore
+    FLAGS_raft_meta_periodic_sync_interval_ms = 1000;
+
+    timer.destroy();
+    timer.wait_for_destroy();
+}
