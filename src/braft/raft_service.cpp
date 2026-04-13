@@ -27,6 +27,17 @@
 #include "braft/node.h"
 #include "braft/node_manager.h"
 #include "glog/logging.h"
+#include "braft/braft_latency.h"
+
+DEFINE_bool(raft_latency_log_batch_append_entries, false,
+            "Enable elapsed time logging for batch_append_entries");
+BRPC_VALIDATE_GFLAG(raft_latency_log_batch_append_entries,
+                    brpc::PassValidate);
+
+DEFINE_bool(raft_latency_log_append_entries, false,
+            "Enable elapsed time logging for append_entries");
+BRPC_VALIDATE_GFLAG(raft_latency_log_append_entries,
+                    brpc::PassValidate);
 
 namespace braft {
 
@@ -97,6 +108,8 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
                             const AppendEntriesRequest* request,
                             AppendEntriesResponse* response,
                             google::protobuf::Closure* done) {
+    BRAFT_LATENCY_BEGIN(FLAGS_raft_latency_log_append_entries)
+
     brpc::ClosureGuard done_guard(done);
     brpc::Controller* cntl =
         static_cast<brpc::Controller*>(cntl_base);
@@ -107,7 +120,7 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
         return;
     }
 
-    scoped_refptr<NodeImpl> node_ptr = 
+    scoped_refptr<NodeImpl> node_ptr =
                         global_node_manager->get(request->group_id(), peer_id);
     NodeImpl* node = node_ptr.get();
     if (!node) {
@@ -115,21 +128,29 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
         return;
     }
 
-    return node->handle_append_entries_request(cntl, request, response, 
-                                               done_guard.release());
+    int entries_size = request->entries_size();
+    const std::string group_id = request->group_id();
+    node->handle_append_entries_request(cntl, request, response,
+                                        done_guard.release());
+    BRAFT_LATENCY_END(
+            FLAGS_raft_latency_log_threshold_ms,
+            "RaftServiceImpl::append_entries elapsed time: " << braft_latency_elapsed << " ms"
+                    << " size: " << entries_size
+                    << " group: " << group_id)
 }
 
 void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl_base,
                             const BatchAppendEntriesRequest* request,
                             BatchAppendEntriesResponse* response,
                             google::protobuf::Closure* done) {
-    brpc::ClosureGuard done_guard(done);
+    BRAFT_LATENCY_BEGIN(FLAGS_raft_latency_log_batch_append_entries)
 
+    brpc::ClosureGuard done_guard(done);
     // status buffer for response
     std::vector<BatchAppendEntriesResponse::Status> statuses;
     // if has error, the statuses will be set to response, else the statuses in response is null.
     bool has_error = false;
-    int64_t start_time = butil::monotonic_time_ms();
+
     for (const auto& req : request->requests()) {
         PeerId peer_id;
         BatchAppendEntriesResponse::Status status;
@@ -192,9 +213,11 @@ void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl
             *mut_status = std::move(status);
         }
     }
-    
-    int64_t eplased_time =  butil::monotonic_time_ms() - start_time;
-    LOG_IF(INFO, eplased_time > 1000) << "batch_append_entries size: " << request->requests_size() << " eplased time: " << eplased_time;
+
+    BRAFT_LATENCY_END(
+            FLAGS_raft_latency_log_threshold_ms,
+            "RaftServiceImpl::batch_append_entries elapsed time: " << braft_latency_elapsed << " ms"
+                    << " size: " << request->requests_size())
 }
 
 void RaftServiceImpl::install_snapshot(google::protobuf::RpcController* cntl_base,
